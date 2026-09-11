@@ -47,3 +47,14 @@ from deep_sdf.cfd.deeponet import (
     PODDeepONet,
     TrunkNet,
 )
+from deep_sdf.cfd.physics import (
+    CollocationSampler,
+    FluidMaskEmpty,
+    IncompressibleNS,
+    PDEInformer,
+    farfield_loss,
+    fluid_mask,
+    noslip_loss,
+    physics_weight_schedule,
+    wall_slip_loss,
+)
