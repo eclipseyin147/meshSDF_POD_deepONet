@@ -178,8 +178,13 @@ deep_sdf/cfd/deeponet.py        # 新增：BranchNet / TrunkNet / PODDeepONet（
 deep_sdf/cfd/physics.py         # 新增：IncompressibleNS(PDE) / PDEInformer（接口对齐 PhysicsInformer）/ BC loss / fluid_mask / CollocationSampler
 deep_sdf/cfd/flow_synth.py      # 新增：物理一致合成场
 deep_sdf/cfd/__init__.py        # 追加导出（既有条目不动）
+deep_sdf/cfd/volume.py          # 修改（追加式）：save_snapshot / load_snapshot 自 train_volume_rom.py 上移至此
+                                # （快照契约 docstring 本就在此模块），既有函数行为不变；如需逐变量 POD 容器亦加在此
+train_volume_rom.py             # 修改（重构式）：改为从 volume.py import 快照 IO，行为不变
 generate_ellipsoid_dataset.py   # 新增（根目录）
 train_pipod_deeponet.py         # 新增（根目录，--stage 1/2/3）
-DEEPMESH.md                     # 实施后新增 PIPOD+DeepONet 一节
-volume.py / surrogate.py / differentiable_mesh.py   # 零改动
+DEEPMESH.md                     # 实施后新增 PIPOD+DeepONet 一节（含 volume.py 重构说明）
+surrogate.py / differentiable_mesh.py   # 零改动
 ```
+
+注：对现有 POD 代码的修改仅限「追加 + 行为不变的重构」（快照 IO 上移）；若实施中发现 `pod_fit`/`PODBasis` 确需改动（如逐变量公共 rank 支持），允许修改，但必须重跑既有回归测试（/tmp 的 volume ROM 测试套件）证明行为不变。
