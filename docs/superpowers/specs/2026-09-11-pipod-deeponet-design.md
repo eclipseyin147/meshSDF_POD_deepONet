@@ -108,7 +108,7 @@ physics loss 只在 `fluid_mask = (sdf > margin)` 上计算（路线图 §15）�
 
 1. SiLU trunk 对 x 的一阶/二阶 autodiff vs 中心有限差分（rel err < 1e-3）；
 2. 球体子集（a=b=c）且 `wake_amp=0` 的真值场上：连续性残差、动量残差 ≈ 0（机器精度外的截断误差有界）——验证残差管线正确性；
-3. stage-1 BranchNet 与现有 `VolumeCoefficientRegressor` 在同任务上的等价性（系数 MSE 同量级）；
+3. stage-1 BranchNet sanity：与现有 `VolumeCoefficientRegressor` 在相同快照数据上对照（注意现有 ROM 是 u,v,w,p 堆叠的联合 POD、本设计为逐变量 cPOD，基不同——只要求留出集重构相对 L2 同量级，不苛求逐位一致）；
 4. 标准化 setter 精确生效（max diff 0.0）；checkpoint save/load 往返逐位一致；同 seed 两次短训逐位一致。
 
 **端到端指标**（并列对照，沿用现有日志风格）
