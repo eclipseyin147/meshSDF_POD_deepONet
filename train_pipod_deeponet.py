@@ -35,6 +35,16 @@ import deep_sdf.utils
 import deep_sdf.workspace as ws
 from deep_sdf.cfd.deeponet import BranchNet, PODDeepONet, TrunkNet
 from deep_sdf.cfd.flow_synth import parse_ellipsoid_axes, potential_flow_field
+from deep_sdf.cfd.physics import (
+    CollocationSampler,
+    FluidMaskEmpty,
+    IncompressibleNS,
+    PDEInformer,
+    farfield_loss,
+    noslip_loss,
+    physics_weight_schedule,
+    wall_slip_loss,
+)
 from deep_sdf.cfd.volume import (
     load_snapshot,
     make_reference_grid,
@@ -362,6 +372,223 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
         time.time() - start, ckpt_path))
 
 
+def physics_losses(model, informer, decoder, latent, bc, points, h,
+                   max_batch):
+    """Continuity + momentum residuals at collocation points (second-order
+    autodiff). d is evaluated through the frozen decoder WITH the graph
+    attached; grad d is detached (the ReLU decoder's second derivative
+    vanishes a.e.). Losses accumulate over chunks, normalized by count."""
+    device = points.device
+    lc = torch.zeros((), device=device)
+    lm = torch.zeros((), device=device)
+    n_tot = 0
+    for chunk in points.split(max_batch):
+        p = chunk.detach().requires_grad_(True)
+        with torch.enable_grad():
+            d = deep_sdf.utils.decode_sdf(decoder, latent, p)
+            g = torch.autograd.grad(d.sum(), p, create_graph=True)[0]
+            feats = torch.cat(
+                [p, d, g.detach(), torch.full_like(d, h)], dim=1)
+            q = model(latent, bc, feats)
+            res = informer({"coordinates": p, "u": q[:, 0:1], "v": q[:, 1:2],
+                            "w": q[:, 2:3], "cp": q[:, 3:4]})
+            lc = lc + (res["continuity"] ** 2).sum()
+            lm = lm + sum((res["momentum_" + k] ** 2).sum() for k in "uvw")
+        n_tot += p.shape[0]
+    return lc / max(n_tot, 1), lm / max(n_tot, 1)
+
+
+def boundary_losses(model, shape, bc, grid_points, idx_wall, idx_far,
+                    wall_bc):
+    """Wall loss on the near-wall band (slip: (u.n)^2 with n from grad SDF;
+    noslip: |u|^2) + far-field loss (u -> unit flow direction)."""
+    l_wall = torch.zeros((), device=grid_points.device)
+    l_far = torch.zeros((), device=grid_points.device)
+    if idx_wall.numel():
+        q_w = model(shape["latent"], bc.unsqueeze(0),
+                    make_features(grid_points, shape, idx_wall))
+        if wall_bc == "slip":
+            n_w = shape["sdf_grad"][idx_wall]
+            n_w = n_w / n_w.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            l_wall = wall_slip_loss(q_w, n_w)
+        else:
+            l_wall = noslip_loss(q_w)
+    if idx_far.numel():
+        q_f = model(shape["latent"], bc.unsqueeze(0),
+                    make_features(grid_points, shape, idx_far))
+        d = bc[1:4]
+        l_far = farfield_loss(q_f, d / d.norm().clamp_min(1e-12))
+    return l_wall, l_far
+
+
+def load_operator_from_checkpoint(model, path):
+    """Initialize the full PODDeepONet from a stage-2 checkpoint."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if state.get("model_type") != "pipod_deeponet_stage2":
+        raise ValueError("stage-3 --init_from expects a stage-2 checkpoint, "
+                         "got {}".format(state.get("model_type")))
+    model.load_state_dict(state["model_state_dict"])
+
+
+def evaluate_physics(model, informer, decoder, bases, val_cases, grid_points,
+                     grid_shape, sampler, args, device):
+    """evaluate_field + physics residuals on a fixed-seed val collocation
+    set + wall violation."""
+    metrics = evaluate_field(model, bases, val_cases, grid_points)
+    conts, moms, walls = [], [], []
+    gen = torch.Generator().manual_seed(args.seed + 12345)  # 固定评估集
+    for s, c in val_cases:
+        try:
+            picks = sampler.sample(grid_points, grid_shape, s["sdf"],
+                                   c["fields"], c["bc"], args.n_collocation,
+                                   gen)
+        except FluidMaskEmpty:
+            continue
+        with torch.enable_grad():
+            lc, lm = physics_losses(model, informer, decoder, s["latent"],
+                                    c["bc"].unsqueeze(0),
+                                    grid_points[picks["collocation"]], s["h"],
+                                    args.phys_chunk)
+        conts.append(lc.sqrt().item())
+        moms.append(lm.sqrt().item())
+        if picks["wall"].numel():
+            with torch.no_grad():
+                q_w = model(s["latent"], c["bc"].unsqueeze(0),
+                            make_features(grid_points, s, picks["wall"]))
+                n_w = s["sdf_grad"][picks["wall"]]
+                n_w = n_w / n_w.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                walls.append(
+                    ((q_w[:, :3] * n_w).sum(1).abs()
+                     / q_w[:, :3].norm(dim=1).clamp_min(1e-12)
+                     ).mean().item())
+    metrics["continuity"] = float(np.mean(conts)) if conts else float("nan")
+    metrics["momentum"] = float(np.mean(moms)) if moms else float("nan")
+    metrics["wall"] = float(np.mean(walls)) if walls else float("nan")
+    return metrics
+
+
+def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
+                 train_cases, val_cases, shapes, decoder, grid_points,
+                 grid_shape, out_dir, rng, device):
+    """Physics-informed fine-tuning from a stage-2 checkpoint:
+    L = lambda_pod L_POD + lambda_field L_field
+        + lambda_phys(progress) * (L_c + L_m + L_wall + L_ff)."""
+    trunk = TrunkNet(in_dim=8, rank=branch_kwargs["rank"], n_outputs=4,
+                     hidden_sizes=tuple(args.trunk_hidden))
+    model = PODDeepONet(branch, trunk).to(device)
+    if not args.init_from:
+        raise SystemExit("stage 3 requires --init_from <stage2.pth>")
+    load_operator_from_checkpoint(model, args.init_from)
+    logging.info("initialized operator from {}".format(args.init_from))
+    build_shape_geometry(decoder, shapes, grid_points, grid_shape)
+    informer = PDEInformer(IncompressibleNS(re=args.re).equations)
+    sampler = CollocationSampler(margin=args.margin)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = torch.nn.MSELoss()
+    gen = torch.Generator().manual_seed(args.seed)
+    num_points = grid_points.shape[0]
+    start = time.time()
+    loss_num = 0.0
+    best = None
+    ckpt_path = os.path.join(out_dir, "stage3.pth")
+
+    def save(val_metrics=None):
+        checkpoint = {
+            "model_type": "pipod_deeponet_stage3",
+            "model_state_dict": model.state_dict(),
+            "branch_kwargs": branch_kwargs,
+            "trunk_kwargs": {"in_dim": 8, "rank": branch_kwargs["rank"],
+                             "n_outputs": 4,
+                             "hidden_sizes": list(args.trunk_hidden)},
+            "rank": branch_kwargs["rank"],
+            "re": args.re,
+            "pod_basis_files": ["pod_basis_{}.pth".format(v)
+                                for v in FIELD_NAMES],
+            "bc_fields": list(deep_sdf.cfd.BC_FIELDS),
+            "grid_resolution": args.grid_resolution,
+            "train_loss": loss_num,
+            "seed": args.seed,
+        }
+        if val_metrics is not None:
+            checkpoint.update({
+                "val_rel_l2": val_metrics["rel_l2"],
+                "val_rel_l2_per_var": val_metrics["rel_l2_per_var"],
+                "val_projection_error": val_metrics["proj"],
+                "val_mean_field_rel_l2": val_metrics["baseline"],
+                "val_continuity": val_metrics["continuity"],
+                "val_momentum": val_metrics["momentum"],
+                "val_wall": val_metrics["wall"],
+            })
+        torch.save(checkpoint, ckpt_path)
+
+    for e in range(int(args.iterations)):
+        progress = e / max(int(args.iterations), 1)
+        lam = (args.lambda_phys if args.lambda_phys is not None
+               else physics_weight_schedule(progress))
+        optimizer.zero_grad()
+        s, c = rng.choice(train_cases)
+        idx = torch.randint(num_points, (args.n_field,),
+                            generator=gen).to(device)
+        q = model(s["latent"], c["bc"].unsqueeze(0),
+                  make_features(grid_points, s, idx))
+        loss_field = ((q - c["fields"][idx]) ** 2).mean(dim=0).sum()
+        loss_pod = loss_fn(
+            model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
+            c["target"].unsqueeze(0))
+        loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
+        phys_terms = {}
+        if lam > 0.0:
+            try:
+                picks = sampler.sample(grid_points, grid_shape, s["sdf"],
+                                       c["fields"], c["bc"],
+                                       args.n_collocation, gen)
+            except FluidMaskEmpty:
+                logging.warning("case {} has no fluid points; skipping "
+                                "physics".format(c["case_id"]))
+                picks = None
+            if picks is not None:
+                lc, lm = physics_losses(
+                    model, informer, decoder, s["latent"],
+                    c["bc"].unsqueeze(0),
+                    grid_points[picks["collocation"]], s["h"],
+                    args.phys_chunk)
+                lw, lf = boundary_losses(model, s, c["bc"], grid_points,
+                                         picks["wall"], picks["far"],
+                                         args.wall_bc)
+                loss = loss + lam * (lc + lm + lw + lf)
+                phys_terms = {"cont": lc.item(), "mom": lm.item(),
+                              "wall": lw.item(), "far": lf.item()}
+        loss.backward()
+        optimizer.step()
+        loss_num = loss.item()
+        if e % 50 == 0:
+            if val_cases:
+                metrics = evaluate_physics(model, informer, decoder, bases,
+                                           val_cases, grid_points,
+                                           grid_shape, sampler, args, device)
+                logging.info(
+                    "iter {} loss: {:.6e} lam: {:.3g} {} | val rel L2: "
+                    "{:.6e} val cont: {:.6e} mom: {:.6e} wall: "
+                    "{:.6e}".format(e, loss_num, lam,
+                                    " ".join("{}={:.2e}".format(k, v)
+                                             for k, v in phys_terms.items()),
+                                    metrics["rel_l2"], metrics["continuity"],
+                                    metrics["momentum"], metrics["wall"]))
+                if best is None or metrics["rel_l2"] < best:
+                    best = metrics["rel_l2"]
+                    save(metrics)
+            else:
+                logging.info("iter {} loss: {:.6e} lam: {:.3g}".format(
+                    e, loss_num, lam))
+    if val_cases and best is None:
+        save(evaluate_physics(model, informer, decoder, bases, val_cases,
+                              grid_points, grid_shape, sampler, args, device))
+    elif not val_cases:
+        save()
+    logging.info("stage-3 training time: {:.2f}s; saved {}".format(
+        time.time() - start, ckpt_path))
+
+
 def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
                  train_cases, val_cases, out_dir, rng):
     optimizer = torch.optim.Adam(branch.parameters(), lr=args.lr)
@@ -566,4 +793,6 @@ if __name__ == "__main__":
                      train_cases, val_cases, shapes, decoder, grid_points,
                      grid_shape, out_dir, rng, device)
     else:
-        raise SystemExit("stage 3 is implemented in Task 8 of the plan")
+        train_stage3(args, branch, branch_kwargs, bases, train_shapes,
+                     train_cases, val_cases, shapes, decoder, grid_points,
+                     grid_shape, out_dir, rng, device)
