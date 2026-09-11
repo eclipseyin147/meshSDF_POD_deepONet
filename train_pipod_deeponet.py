@@ -33,7 +33,7 @@ import deep_sdf.cfd
 import deep_sdf.data
 import deep_sdf.utils
 import deep_sdf.workspace as ws
-from deep_sdf.cfd.deeponet import BranchNet
+from deep_sdf.cfd.deeponet import BranchNet, PODDeepONet, TrunkNet
 from deep_sdf.cfd.flow_synth import parse_ellipsoid_axes, potential_flow_field
 from deep_sdf.cfd.volume import (
     load_snapshot,
@@ -42,6 +42,7 @@ from deep_sdf.cfd.volume import (
     save_snapshot,
     snapshot_filename,
 )
+from deep_sdf.differentiable_mesh import compute_sdf_gradients
 from train_pressure_surrogate import (
     load_or_fit_latent,
     make_bc,
@@ -186,6 +187,179 @@ def evaluate_stage1(branch, bases, flat_cases):
             "rel_l2": float(np.mean(rel_l2s)),
             "proj": float(np.mean(projs)),
             "baseline": float(np.mean(baselines))}
+
+
+def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
+                         max_batch=2 ** 18):
+    """Per-shape detached SDF + SDF-gradient features on the reference grid
+    (data-loss branch), cached on the shape dict."""
+    spacing = float(grid_points[:, 0].max() - grid_points[:, 0].min())
+    spacing /= max(grid_shape[0] - 1, 1)
+    for s in shapes:
+        if "sdf" in s:
+            continue
+        sds = []
+        with torch.no_grad():
+            head = 0
+            while head < grid_points.shape[0]:
+                chunk = grid_points[head:head + max_batch]
+                sds.append(deep_sdf.utils.decode_sdf(
+                    decoder, s["latent"], chunk).squeeze(1).float())
+                head += max_batch
+        s["sdf"] = torch.cat(sds, 0)
+        s["sdf_grad"] = compute_sdf_gradients(
+            decoder, s["latent"], grid_points, max_batch)
+        s["h"] = spacing
+
+
+def make_features(grid_points, shape, idx):
+    """(n, 8) trunk features [x, y, z, sdf, dsdf/dx, dsdf/dy, dsdf/dz, h]."""
+    n = idx.numel()
+    return torch.cat([
+        grid_points[idx],
+        shape["sdf"][idx].unsqueeze(1),
+        shape["sdf_grad"][idx],
+        torch.full((n, 1), shape["h"], device=grid_points.device),
+    ], dim=1)
+
+
+def predict_field(model, shape, bc, grid_points, chunk=2 ** 16):
+    """Full-grid field prediction (no_grad, chunked) -> (G, 4)."""
+    outs = []
+    with torch.no_grad():
+        for i in range(0, grid_points.shape[0], chunk):
+            idx = torch.arange(i, min(i + chunk, grid_points.shape[0]),
+                               device=grid_points.device)
+            outs.append(model(shape["latent"], bc.unsqueeze(0),
+                              make_features(grid_points, shape, idx)))
+    return torch.cat(outs, 0)
+
+
+def evaluate_field(model, bases, flat_cases, grid_points):
+    """Per-variable and mean relative L2 of the full-grid prediction, plus
+    the projection lower bound and the mean-field baseline (both from the
+    POD bases) and the standardized coefficient MSE."""
+    loss_fn = torch.nn.MSELoss()
+    rel_l2_v, projs, baselines, coef_mses = [], [], [], []
+    for s, c in flat_cases:
+        pred = predict_field(model, s, c["bc"], grid_points)
+        truth = c["fields"]
+        per_var = ((pred - truth).pow(2).sum(0)
+                   / truth.pow(2).sum(0).clamp_min(1e-30)).sqrt()
+        rel_l2_v.append(per_var.cpu())
+        coef_mses.append(loss_fn(
+            model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
+            c["target"].unsqueeze(0)).item())
+        ps, bs = [], []
+        for v in range(4):
+            Y = truth[:, v].unsqueeze(0)
+            ps.append(bases[v].projection_error(Y)[0].item())
+            bs.append(bases[v].relative_error(
+                Y, torch.zeros(1, bases[v].rank, device=Y.device))[0].item())
+        projs.append(float(np.mean(ps)))
+        baselines.append(float(np.mean(bs)))
+    per_var = torch.stack(rel_l2_v).mean(0)
+    return {"coef_mse": float(np.mean(coef_mses)),
+            "rel_l2": float(per_var.mean()),
+            "rel_l2_per_var": [float(x) for x in per_var],
+            "proj": float(np.mean(projs)),
+            "baseline": float(np.mean(baselines))}
+
+
+def load_branch_from_checkpoint(branch, path):
+    """Initialize branch weights from a stage-1 checkpoint."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if state.get("model_type") != "pipod_deeponet_stage1":
+        raise ValueError("stage-2 --init_from expects a stage-1 checkpoint, "
+                         "got {}".format(state.get("model_type")))
+    branch.load_state_dict(state["model_state_dict"])
+
+
+def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
+                 train_cases, val_cases, shapes, decoder, grid_points,
+                 grid_shape, out_dir, rng, device):
+    """Branch + trunk field training: L = lambda_pod * L_POD + lambda_field *
+    L_field (per-variable pointwise MSE summed over variables, the
+    ChannelwiseMSE convention of mPOD-DeepONet)."""
+    if args.init_from:
+        load_branch_from_checkpoint(branch, args.init_from)
+        logging.info("initialized branch from {}".format(args.init_from))
+    trunk = TrunkNet(in_dim=8, rank=branch_kwargs["rank"], n_outputs=4,
+                     hidden_sizes=tuple(args.trunk_hidden))
+    model = PODDeepONet(branch, trunk).to(device)
+    build_shape_geometry(decoder, shapes, grid_points, grid_shape)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = torch.nn.MSELoss()
+    gen = torch.Generator().manual_seed(args.seed)
+    num_points = grid_points.shape[0]
+    start = time.time()
+    loss_num = 0.0
+    best = None
+    ckpt_path = os.path.join(out_dir, "stage2.pth")
+
+    def save(val_metrics=None):
+        checkpoint = {
+            "model_type": "pipod_deeponet_stage2",
+            "model_state_dict": model.state_dict(),
+            "branch_kwargs": branch_kwargs,
+            "trunk_kwargs": {"in_dim": 8, "rank": branch_kwargs["rank"],
+                             "n_outputs": 4,
+                             "hidden_sizes": list(args.trunk_hidden)},
+            "rank": branch_kwargs["rank"],
+            "pod_basis_files": ["pod_basis_{}.pth".format(v)
+                                for v in FIELD_NAMES],
+            "bc_fields": list(deep_sdf.cfd.BC_FIELDS),
+            "grid_resolution": args.grid_resolution,
+            "train_loss": loss_num,
+            "seed": args.seed,
+        }
+        if val_metrics is not None:
+            checkpoint.update({
+                "val_coef_mse": val_metrics["coef_mse"],
+                "val_rel_l2": val_metrics["rel_l2"],
+                "val_rel_l2_per_var": val_metrics["rel_l2_per_var"],
+                "val_projection_error": val_metrics["proj"],
+                "val_mean_field_rel_l2": val_metrics["baseline"],
+            })
+        torch.save(checkpoint, ckpt_path)
+
+    for e in range(int(args.iterations)):
+        optimizer.zero_grad()
+        s, c = rng.choice(train_cases)
+        idx = torch.randint(num_points, (args.n_field,),
+                            generator=gen).to(device)
+        q = model(s["latent"], c["bc"].unsqueeze(0),
+                  make_features(grid_points, s, idx))
+        loss_field = ((q - c["fields"][idx]) ** 2).mean(dim=0).sum()
+        loss_pod = loss_fn(
+            model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
+            c["target"].unsqueeze(0))
+        loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
+        loss.backward()
+        optimizer.step()
+        loss_num = loss.item()
+        if e % 50 == 0:
+            if val_cases:
+                metrics = evaluate_field(model, bases, val_cases, grid_points)
+                logging.info(
+                    "iter {} loss: {:.6e} (pod {:.6e} field {:.6e}) | val rel "
+                    "L2: {:.6e} per-var {} proj: {:.6e} mean-field: "
+                    "{:.6e}".format(e, loss_num, loss_pod.item(),
+                                    loss_field.item(), metrics["rel_l2"],
+                                    ["%.3f" % v for v in
+                                     metrics["rel_l2_per_var"]],
+                                    metrics["proj"], metrics["baseline"]))
+                if best is None or metrics["rel_l2"] < best:
+                    best = metrics["rel_l2"]
+                    save(metrics)
+            else:
+                logging.info("iter {} loss: {:.6e}".format(e, loss_num))
+    if val_cases and best is None:
+        save(evaluate_field(model, bases, val_cases, grid_points))
+    elif not val_cases:
+        save()
+    logging.info("stage-2 training time: {:.2f}s; saved {}".format(
+        time.time() - start, ckpt_path))
 
 
 def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
@@ -387,7 +561,9 @@ if __name__ == "__main__":
     if args.stage == 1:
         train_stage1(args, branch, branch_kwargs, bases, train_shapes,
                      train_cases, val_cases, out_dir, rng)
+    elif args.stage == 2:
+        train_stage2(args, branch, branch_kwargs, bases, train_shapes,
+                     train_cases, val_cases, shapes, decoder, grid_points,
+                     grid_shape, out_dir, rng, device)
     else:
-        raise SystemExit(
-            "stage {} is implemented in a later task of the plan".format(
-                args.stage))
+        raise SystemExit("stage 3 is implemented in Task 8 of the plan")
