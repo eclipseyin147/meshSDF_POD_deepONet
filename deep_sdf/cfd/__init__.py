@@ -42,3 +42,8 @@ from deep_sdf.cfd.volume import (
     snapshot_filename,
     synthetic_volume_field,
 )
+from deep_sdf.cfd.deeponet import (
+    BranchNet,
+    PODDeepONet,
+    TrunkNet,
+)
