@@ -10,8 +10,8 @@ One case per (shape, boundary condition):
 - ``write_stl_from_geometry`` exports the body surface STL, either analytic
   (``axes=(a, b, c)``: a trimesh icosphere with ``subdivisions=3`` scaled by
   the semi-axes - analytically exact) or from a decoder latent code via
-  ``deep_sdf.differentiable_mesh.extract_differentiable_mesh`` with the CPU
-  ``skimage`` marching-cubes backend (no GPU occupancy);
+  ``mesh_from_latent`` (dense-grid skimage marching cubes, CPU only - no GPU
+  occupancy);
 - ``make_case`` writes a complete OpenFOAM 14 case: blockMesh base grid
   (``n_base``^3 over ``[-domain_half, domain_half]^3``), snappyHexMesh
   surface refinement (``surface_level``), a wake refinement box extending 6
@@ -50,6 +50,12 @@ import numpy as np
 import torch
 import trimesh
 
+try:
+    from skimage.measure import marching_cubes
+except ImportError:
+    from skimage.measure import marching_cubes_lewiner as marching_cubes
+
+import deep_sdf.utils
 from deep_sdf.cfd.labels import export_stl
 from deep_sdf.cfd.volume import save_snapshot
 
@@ -137,6 +143,80 @@ def wake_refinement_box(direction):
     return lo, hi
 
 
+def mesh_from_latent(decoder, latent, resolution=63, max_batch=2 ** 18):
+    """CPU extraction of the decoder's zero level set for ``latent``.
+
+    The SDF is evaluated with ``deep_sdf.utils.decode_sdf`` (in ``max_batch``
+    chunks) on a dense regular ``resolution``^3 grid over [-1, 1]^3 and the
+    iso-surface extracted with the skimage marching-cubes implementation.
+    Everything runs on the CPU: ``deep_sdf.differentiable_mesh`` cannot be
+    used here because it hardcodes ``.cuda()`` and the GPU is reserved for
+    training. Returns (verts (M, 3) float32, faces (F, 3) int64); an empty
+    iso-surface gives (0, 3) / (0, 3) tensors.
+    """
+    import deep_sdf.differentiable_mesh as dm  # for _grid_coords/_domain
+
+    if hasattr(decoder, "eval"):
+        decoder.eval()
+    latent = torch.as_tensor(latent, dtype=torch.float32).reshape(1, -1).cpu()
+    origin, extent = dm._domain(None)
+    n = int(resolution)
+    coords = dm._grid_coords(n, origin, extent)
+    values = torch.zeros(n ** 3)
+    with torch.no_grad():
+        head = 0
+        while head < n ** 3:
+            chunk = coords[head : head + max_batch]
+            values[head : head + max_batch] = (
+                deep_sdf.utils.decode_sdf(decoder, latent, chunk)
+                .squeeze(1)
+                .detach()
+                .cpu()
+            )
+            head += max_batch
+    grid = values.reshape(n, n, n).numpy()
+    voxel_size = extent / (n - 1)
+    try:
+        verts_np, faces_np, _, _ = marching_cubes(
+            grid, level=0.0, spacing=(voxel_size,) * 3
+        )
+    except (ValueError, RuntimeError) as e:
+        logging.warning("iso-surface extraction failed: {}".format(e))
+        return torch.zeros(0, 3), torch.zeros(0, 3).long()
+    if verts_np.shape[0] == 0:
+        return torch.zeros(0, 3), torch.zeros(0, 3).long()
+    verts = torch.from_numpy(verts_np.copy()).float() + torch.as_tensor(
+        origin, dtype=torch.float32
+    )
+    faces = torch.from_numpy(faces_np.copy()).long()
+    return verts, faces
+
+
+def decoder_sdf_mask(decoder, latent, grid_points, max_batch=2 ** 18):
+    """Inside-body mask (sdf < 0) of a decoder latent on arbitrary points.
+
+    CPU evaluation in ``max_batch`` chunks; returns a bool numpy array of
+    shape (N,). Used as the ``sdf_mask`` argument of ``sample_to_snapshot``
+    for non-analytic (latent) shapes."""
+    if hasattr(decoder, "eval"):
+        decoder.eval()
+    latent = torch.as_tensor(latent, dtype=torch.float32).reshape(1, -1).cpu()
+    pts = torch.as_tensor(grid_points, dtype=torch.float32).reshape(-1, 3).cpu()
+    values = torch.zeros(pts.shape[0])
+    with torch.no_grad():
+        head = 0
+        while head < pts.shape[0]:
+            chunk = pts[head : head + max_batch]
+            values[head : head + max_batch] = (
+                deep_sdf.utils.decode_sdf(decoder, latent, chunk)
+                .squeeze(1)
+                .detach()
+                .cpu()
+            )
+            head += max_batch
+    return (values < 0.0).numpy()
+
+
 def write_stl_from_geometry(path, axes=None, decoder=None, latent=None,
                             resolution=63):
     """Write the body surface as an ASCII STL.
@@ -144,11 +224,10 @@ def write_stl_from_geometry(path, axes=None, decoder=None, latent=None,
     Analytic path (``axes=(a, b, c)``): a trimesh icosphere with
     ``subdivisions=3`` scaled by the semi-axes (analytically exact for the
     ellipsoid family). Latent path (``decoder`` + ``latent``): the zero level
-    set extracted with
-    ``deep_sdf.differentiable_mesh.extract_differentiable_mesh`` on the CPU
-    skimage marching-cubes backend (the GPU is reserved for training) at the
-    given octree ``resolution``. Both paths export through
-    ``deep_sdf.cfd.labels.export_stl`` (solid name "deepsdf").
+    set extracted with ``mesh_from_latent`` (dense ``resolution``^3 SDF grid,
+    CPU skimage marching cubes - the GPU is reserved for training). Both
+    paths export through ``deep_sdf.cfd.labels.export_stl`` (solid name
+    "deepsdf").
     """
     if axes is not None:
         mesh = trimesh.creation.icosphere(subdivisions=3)
@@ -157,11 +236,7 @@ def write_stl_from_geometry(path, axes=None, decoder=None, latent=None,
         ).float()
         faces = torch.from_numpy(np.asarray(mesh.faces))
     elif decoder is not None and latent is not None:
-        from deep_sdf.differentiable_mesh import extract_differentiable_mesh
-
-        verts, faces, _ = extract_differentiable_mesh(
-            decoder, latent, resolution=resolution, mc_backend="skimage"
-        )
+        verts, faces = mesh_from_latent(decoder, latent, resolution=resolution)
         if verts.shape[0] == 0:
             raise RuntimeError(
                 "iso-surface extraction produced an empty mesh for the "
