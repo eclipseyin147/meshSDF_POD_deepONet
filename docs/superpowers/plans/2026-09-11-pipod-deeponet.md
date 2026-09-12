@@ -2812,3 +2812,63 @@ cd /home/siqi/CLionProjects/DeepSDF
 git add DEEPMESH.md
 git commit -m "Document PIPOD-DeepONet volume operator (stages 1-3) with validation results"
 ```
+
+---
+
+## 追加：OpenFOAM 真实数据线（Task 10–12，2026-09-12 用户指令）
+
+用户指令：OpenFOAM 14 已安装（`source /opt/openfoam14/etc/bashrc`；20 核 CPU / 62GB RAM）。构造简单外流场案例训练测试：**bounding box ≥ 10× 最长轴**；**snappyHexMesh 创建边界层网格**；**基于椭球 latent code 做 Latin Hypercube Sampling 生成小训练样本集并快速 CFD**。流态裁定：**层流 simpleFoam**（ν=0.1，Re≈U·L/ν≈270——层流速度场严格散度自由、NS 动量与 physics loss 同构，无 Reynolds 应力项）。规模裁定：**先 2 案例端到端验证管道，再 60 LHS 形状 × 4 BC = 240 案例**。
+
+与合成场线的关系：追加对照；合成场 e2e（stage 1/2/3）照常完成并如实记录（含 stage-2 在 64³ 上 val rel L2 0.934 ≈ 均值基线的弱泛化结果——数据量瓶颈正是 LHS 数据线要解决的）。
+
+### Task 10: OpenFOAM 案例管线（`deep_sdf/cfd/openfoam_runner.py` + `generate_openfoam_snapshots.py`）+ 2 案例端到端验证
+
+**Files:**
+- Create: `deep_sdf/cfd/openfoam_runner.py`
+- Create: `generate_openfoam_snapshots.py`（根目录）
+- Test: `/tmp/test_openfoam_pipeline.py`
+
+**Interfaces:**
+- Consumes: `deep_sdf.cfd.volume.save_snapshot/load_snapshot/make_reference_grid`、`deep_sdf.cfd.flow_synth.parse_ellipsoid_axes`、`deep_sdf.cfd.labels.export_stl`、`deep_sdf.differentiable_mesh.extract_differentiable_mesh`（latent→STL 路径）、trimesh（.venv 已有）。
+- Produces:
+  - `write_stl_from_geometry(path, axes=None, decoder=None, latent=None, resolution=63)`：椭球走 trimesh icosphere(subdivisions=3) 按 axes 缩放（解析精确）；latent 走 decoder→提取→导出；
+  - `make_case(case_dir, stl_path, bc, nu=0.1, domain_half=18.0, n_base=36, layers=6, layer_ratio=1.25, first_layer=0.011, surface_level=3, end_time=2000, residual_p=1e-5, residual_u=1e-6)`：写完整 OpenFOAM 14 case；
+  - `run_case(case_dir)`：blockMesh → snappyHexMesh → simpleFoam（OF14 下若 simpleFoam 兼容封装不可用则用 `foamRun -solver incompressibleFluid`）→ 末端采样；
+  - `sample_to_snapshot(case_dir, grid_points, shape_name, bc, out_path)`：在 64³ 参考网格点采样 (U,p)，Cp = p/(0.5U²)，体内（SDF<0）u=0，写 npz 契约。
+
+**案例设置（需求硬值）：**
+
+- 域：`[-D, D]³`，D = 18.0（≥10× 最长全轴 1.8）；外边界全部 freestream（`freestreamVelocity`/`freestreamPressure`，值 = U·dir——任意来流方向无需旋转几何）；
+- 壁面 noSlip（粘性数据；训练侧对应 `--wall_bc noslip`）；
+- blockMesh 基础网格 36³（1 单元/单位长）；snappyHexMesh：表面加密 level 3（单元 ~0.125）、尾迹 refinementBox（下游延伸到 x+6，level 2）、snap、**addLayers 6 层 expansionRatio 1.25 首层 ~0.011**（层流边界层 δ≈L/√Re≈0.11 内有 6+ 单元）；
+- 求解：`simulationType laminar`（OF14 为 constant/momentumTransport），SIMPLE + consistent，relaxation U 0.7 / p 0.3，GAMG 求解 p；endTime 2000 迭代或残差达标即止；
+- 采样：probes/sampledSet cloud 在参考网格全部 G=262144 点（C-order，x 慢 z 快）取 (U, p)，点序即输入序；
+- 单位制与坐标：全部在 DeepSDF 归一化坐标系（几何 ~[-1,1]³，域 [-18,18]³）。
+
+**验证（2 案例端到端，/tmp/test_openfoam_pipeline.py）：**
+
+1. 椭球 a=0.9,b=0.7,c=0.5，bc=[15, 1, 0, 0]：checkMesh 通过；simpleFoam 残差达标收敛；采样文件 262144 点齐全；
+2. 远场点（|x|>12）|u−U·dir|/U < 5%（域足够大、阻塞可忽略）；驻点附近 max Cp ∈ [0.8, 1.3]（层流势流近似量级）；尾迹区有速度亏损；
+3. npz 经 load_snapshot 校验通过；fields (G,4) float32；
+4. 第二案例不同方向（bc=[12, 0.48, 0.64, 0.6] 归一）验证 freestream 任意方向。
+
+**Step 结构**：TDD（先写契约级测试：npz 格式/掩码/函数签名，管道函数先用 dry-run 桩过测试，再真跑 2 案例验收上述物理判据）→ commit（只 add 两个新文件）。
+
+### Task 11: LHS 形状采样 + 全量 240 案例
+
+**Files:**
+- Modify: `generate_openfoam_snapshots.py`（加 `--lhs N` 模式）
+- Test: `/tmp/test_lhs_shapes.py`
+
+**要点：**
+- 从 `examples/ellipsoids/LatentCodes/latest.pth` 读 27 个训练 latent（16 维），逐维取 [min, max] 外扩 10% 为 LHS 边界；`--lhs 60` 采样 60 个 z（numpy LHS 实现，`--seed` 可复现）；
+- 每个 z：decoder → SDF → extract_differentiable_mesh（resolution 63）→ 合法性检查（面数 > 500、顶点范围在 [-1.2, 1.2]³ 内、法向一致）→ STL；不合格样本跳过并记录；
+- 形状命名：`lhs/shape_XXX.npz` 风格占位——注意 npz 契约的 shape 字段须能被训练侧映射到 latent：快照 npz 的 `shape` 直接存 latent 文件相对路径不行（split 中没有）；处理：`--snapshots` 模式下训练脚本目前按 split 名字索引 latent。**裁定**：为 LHS 形状生成 manifest `lhs_latents.npz`（shape 名 → z 向量），训练脚本加 `--latent_manifest` 覆盖 load_or_fit_latent（新增小功能，含测试）；
+- 并发：4 路并行案例（各串行 simpleFoam），240 案例预计 4–8h；失败案例（网格/收敛）跳过并汇总报告（成功率应 > 90%）。
+
+### Task 12: 真实数据三阶段训练 + 对比 + 文档
+
+**要点：**
+- `train_pipod_deeponet.py --snapshots data/openfoam/ellipsoids/snapshots --latent_manifest ... --stage 1/2/3 --wall_bc noslip --re 270 --grid_resolution 64`（层流 Re=270 与 CFD 一致；λ 日程不变）；
+- 与合成场结果并排对比（val rel L2 / 物理残差 / 前向耗时）；DEEPMESH.md 更新 OpenFOAM 数据线一节（含网格/边界层参数、收敛统计、成功率）；
+- commit 只含文档与（如有）训练脚本的 latent_manifest 小功能。
