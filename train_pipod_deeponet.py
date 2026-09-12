@@ -15,6 +15,15 @@ energy-truncated ranks unless --pod_rank fixes it. With --synthetic the
 physics-consistent potential-flow fields (deep_sdf.cfd.flow_synth) are
 written to <experiment>/PipodONet/snapshots/ and read back through the same
 npz path as real data.
+
+With --latent_manifest <npz> (generate_openfoam_snapshots.save_manifest
+format: names + latents) the shape list and latents come from the manifest
+instead of the split: z is taken directly (reshape (1, L)), skipping
+load_or_fit_latent's reconstruction. Mutually exclusive with --synthetic;
+snapshots are still indexed by shape name from --snapshots.
+
+Every stage appends evaluation records to
+<experiment>/PipodONet/metrics_stage<1|2|3>.jsonl (overwritten per run).
 """
 
 import argparse
@@ -53,6 +62,7 @@ from deep_sdf.cfd.volume import (
     snapshot_filename,
 )
 from deep_sdf.differentiable_mesh import compute_sdf_gradients
+from generate_openfoam_snapshots import load_manifest
 from train_pressure_surrogate import (
     load_or_fit_latent,
     make_bc,
@@ -62,25 +72,79 @@ from train_pressure_surrogate import (
 FIELD_NAMES = ["u", "v", "w", "p"]
 
 
+class MetricsLogger:
+    """Per-stage JSONL metrics log at <out_dir>/metrics_stage<N>.jsonl.
+
+    The file is created (overwritten) at the start of every run and flushed
+    per record so training curves can be followed live. NaN/Inf floats are
+    written as null to keep every line strict JSON."""
+
+    def __init__(self, out_dir, stage):
+        self.path = os.path.join(out_dir, "metrics_stage{}.jsonl".format(stage))
+        self.handle = open(self.path, "w")
+
+    @staticmethod
+    def _clean(value):
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        if isinstance(value, (list, tuple)):
+            return [MetricsLogger._clean(v) for v in value]
+        return value
+
+    def log(self, record):
+        self.handle.write(json.dumps({k: self._clean(v)
+                                      for k, v in record.items()}) + "\n")
+        self.handle.flush()
+
+    def close(self):
+        self.handle.close()
+
+
+def _val_record(metrics):
+    return {"val_" + k: v for k, v in metrics.items()}
+
+
 def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
                  grid_points, grid_shape, num_points, snapshots_dir, rng,
                  device):
     """Per shape: latent (loaded or fitted, train_volume_rom convention) +
-    per-case snapshots (nondimensionalized at load: velocity /= U)."""
+    per-case snapshots (nondimensionalized at load: velocity /= U).
+
+    Shape enumeration has two branches: the default enumerates the split
+    npz names and obtains each latent via load_or_fit_latent; with
+    --latent_manifest the shapes and latents come straight from the manifest
+    (z reshaped to (1, L), no reconstruction)."""
     snap_index = {}
     if args.snapshots:
         for path in sorted(glob.glob(os.path.join(snapshots_dir, "*.npz"))):
             data = np.load(path, allow_pickle=False)
             snap_index.setdefault(str(data["shape"]), []).append(path)
 
+    if args.latent_manifest:
+        names, latents = load_manifest(args.latent_manifest)
+        if latents.ndim != 2 or latents.shape[1] != latent_size:
+            raise RuntimeError(
+                "manifest {} latents have shape {}, expected (N, {})".format(
+                    args.latent_manifest, latents.shape, latent_size))
+        logging.info("latent manifest {}: {} shapes, latents taken directly "
+                     "(reconstruction skipped)".format(args.latent_manifest,
+                                                       len(names)))
+        shape_entries = [
+            (name, torch.from_numpy(latents[i]).reshape(
+                1, latent_size).float().to(device))
+            for i, name in enumerate(names)]
+    else:
+        shape_entries = [(npz, None) for npz in npz_filenames if "npz" in npz]
+
     shapes = []
-    for npz in npz_filenames:
-        if "npz" not in npz:
-            continue
+    for npz, manifest_latent in shape_entries:
         logging.info("processing {}".format(npz))
-        latent = load_or_fit_latent(
-            args, decoder, latent_size, saved_model_epoch, npz
-        )
+        if manifest_latent is not None:
+            latent = manifest_latent
+        else:
+            latent = load_or_fit_latent(
+                args, decoder, latent_size, saved_model_epoch, npz
+            )
         cases = []
         if args.synthetic:
             axes = parse_ellipsoid_axes(npz)
@@ -306,6 +370,7 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
     loss_num = 0.0
     best = None
     ckpt_path = os.path.join(out_dir, "stage2.pth")
+    metrics_log = MetricsLogger(out_dir, 2)
 
     def save(val_metrics=None):
         checkpoint = {
@@ -351,6 +416,9 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
         if e % 50 == 0:
             if val_cases:
                 metrics = evaluate_field(model, bases, val_cases, grid_points)
+                metrics_log.log({"iter": e, "loss": loss_num,
+                                 "lr": optimizer.param_groups[0]["lr"],
+                                 **_val_record(metrics)})
                 logging.info(
                     "iter {} loss: {:.6e} (pod {:.6e} field {:.6e}) | val rel "
                     "L2: {:.6e} per-var {} proj: {:.6e} mean-field: "
@@ -365,9 +433,14 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
             else:
                 logging.info("iter {} loss: {:.6e}".format(e, loss_num))
     if val_cases and best is None:
-        save(evaluate_field(model, bases, val_cases, grid_points))
+        metrics = evaluate_field(model, bases, val_cases, grid_points)
+        best = metrics["rel_l2"]
+        save(metrics)
     elif not val_cases:
         save()
+    metrics_log.log({"final": True, "time_s": time.time() - start,
+                     "best_val_rel_l2": best})
+    metrics_log.close()
     logging.info("stage-2 training time: {:.2f}s; saved {}".format(
         time.time() - start, ckpt_path))
 
@@ -491,6 +564,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
     loss_num = 0.0
     best = None
     ckpt_path = os.path.join(out_dir, "stage3.pth")
+    metrics_log = MetricsLogger(out_dir, 3)
 
     def save(val_metrics=None):
         checkpoint = {
@@ -566,6 +640,10 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                 metrics = evaluate_physics(model, informer, decoder, bases,
                                            val_cases, grid_points,
                                            grid_shape, sampler, args, device)
+                metrics_log.log({"iter": e, "loss": loss_num,
+                                 "lr": optimizer.param_groups[0]["lr"],
+                                 "lambda_phys": lam,
+                                 **_val_record(metrics)})
                 logging.info(
                     "iter {} loss: {:.6e} lam: {:.3g} {} | val rel L2: "
                     "{:.6e} val cont: {:.6e} mom: {:.6e} wall: "
@@ -581,10 +659,16 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                 logging.info("iter {} loss: {:.6e} lam: {:.3g}".format(
                     e, loss_num, lam))
     if val_cases and best is None:
-        save(evaluate_physics(model, informer, decoder, bases, val_cases,
-                              grid_points, grid_shape, sampler, args, device))
+        metrics = evaluate_physics(model, informer, decoder, bases, val_cases,
+                                   grid_points, grid_shape, sampler, args,
+                                   device)
+        best = metrics["rel_l2"]
+        save(metrics)
     elif not val_cases:
         save()
+    metrics_log.log({"final": True, "time_s": time.time() - start,
+                     "best_val_rel_l2": best})
+    metrics_log.close()
     logging.info("stage-3 training time: {:.2f}s; saved {}".format(
         time.time() - start, ckpt_path))
 
@@ -597,6 +681,7 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
     loss_num = 0.0
     best = None
     ckpt_path = os.path.join(out_dir, "stage1.pth")
+    metrics_log = MetricsLogger(out_dir, 1)
 
     def save(val_metrics=None):
         checkpoint = {
@@ -634,6 +719,9 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
         if e % 50 == 0:
             if val_cases:
                 metrics = evaluate_stage1(branch, bases, val_cases)
+                metrics_log.log({"iter": e, "loss": loss_num,
+                                 "lr": optimizer.param_groups[0]["lr"],
+                                 **_val_record(metrics)})
                 logging.info(
                     "iter {} mse: {:.6e} | val coef mse: {:.6e} rel L2: "
                     "{:.6e} proj bound: {:.6e} mean-field: {:.6e}".format(
@@ -646,9 +734,13 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
                 logging.info("iter {} mse: {:.6e}".format(e, loss_num))
     if val_cases and best is None:
         metrics = evaluate_stage1(branch, bases, val_cases)
+        best = metrics["rel_l2"]
         save(metrics)
     elif not val_cases:
         save()
+    metrics_log.log({"final": True, "time_s": time.time() - start,
+                     "best_val_rel_l2": best})
+    metrics_log.close()
     logging.info("stage-1 training time: {:.2f}s; saved {}".format(
         time.time() - start, ckpt_path))
 
@@ -665,6 +757,14 @@ if __name__ == "__main__":
     parser.add_argument("--data", "-d", dest="data_source", required=True)
     parser.add_argument("--split", "-s", dest="split_filename", required=True)
     parser.add_argument("--snapshots", dest="snapshots", default=None)
+    parser.add_argument("--latent_manifest", dest="latent_manifest",
+                        default=None,
+                        help="npz manifest (names + latents, the "
+                        "generate_openfoam_snapshots.save_manifest format): "
+                        "shapes and latents are taken from the manifest "
+                        "instead of the split, skipping latent "
+                        "reconstruction; requires --snapshots, mutually "
+                        "exclusive with --synthetic")
     parser.add_argument("--synthetic", dest="synthetic", action="store_true")
     parser.add_argument("--grid_resolution", type=int, default=64)
     parser.add_argument("--pod_energy", type=float, default=0.999)
@@ -707,6 +807,9 @@ if __name__ == "__main__":
 
     if bool(args.snapshots) == bool(args.synthetic):
         raise RuntimeError("pass exactly one of --snapshots <dir> or --synthetic")
+    if args.latent_manifest and args.synthetic:
+        raise RuntimeError("--synthetic and --latent_manifest are mutually "
+                           "exclusive (synthetic shapes come from the split)")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -727,10 +830,12 @@ if __name__ == "__main__":
     for param in decoder.parameters():
         param.requires_grad = False
 
-    with open(args.split_filename) as f:
-        split = json.load(f)
-    npz_filenames = deep_sdf.data.get_instance_filenames(
-        args.data_source, split)
+    npz_filenames = None
+    if not args.latent_manifest:
+        with open(args.split_filename) as f:
+            split = json.load(f)
+        npz_filenames = deep_sdf.data.get_instance_filenames(
+            args.data_source, split)
 
     device = torch.device("cuda")
     out_dir = os.path.join(args.experiment_directory, "PipodONet")
