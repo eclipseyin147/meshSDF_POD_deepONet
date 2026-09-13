@@ -1011,6 +1011,8 @@ if __name__ == "__main__":
                     [c["fields"][:, FIELD_NAMES.index(v)]
                      for _, c in train_cases])).mean().item()))
     logging.info("common POD rank r = %d", rank)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()  # release the POD fit's reserved blocks
     set_targets(bases, train_cases + val_cases)
 
     branch_kwargs = {
