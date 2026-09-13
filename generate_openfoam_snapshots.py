@@ -394,16 +394,18 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
 
     bounds = lhs_bounds(train_latents, margin=0.1)
     z_samples = lhs_sample(args.lhs, bounds, args.seed)
+    offset = int(args.lhs_offset)
     logging.info(
-        "LHS: %d samples in %d dims (bounds expanded by 10%%), seed %d",
-        z_samples.shape[0], z_samples.shape[1], args.seed,
+        "LHS: %d samples in %d dims (bounds expanded by 10%%), seed %d, "
+        "offset %d",
+        z_samples.shape[0], z_samples.shape[1], args.seed, offset,
     )
 
     # decoder mesh extraction + validity check (serial, CPU-only)
     lhs_accepted = []  # (name, z float32)
     lhs_rejected = []
     for i, z in enumerate(z_samples):
-        name = "lhs/shape_{:03d}.npz".format(i)
+        name = "lhs/shape_{:03d}.npz".format(offset + i)
         try:
             verts, faces = openfoam_runner.mesh_from_latent(
                 decoder, z, resolution=63
@@ -425,12 +427,28 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         len(lhs_accepted), len(lhs_rejected),
     )
 
-    # latent manifest: 27 training ellipsoids + accepted LHS samples
-    manifest_names = list(latent_names) + [n for n, _, _, _ in lhs_accepted]
-    manifest_latents = np.vstack(
-        [train_latents]
-        + [z.reshape(1, -1) for _, z, _, _ in lhs_accepted]
-    ).astype(np.float32)
+    # latent manifest: existing manifest (if any) is merged so --lhs_offset
+    # batches accumulate; otherwise start from the 27 training ellipsoids
+    if os.path.isfile(args.manifest):
+        prev_names, prev_latents = load_manifest(args.manifest)
+        manifest_names = list(prev_names)
+        manifest_latents = prev_latents
+        logging.info(
+            "merging into existing manifest: %d shapes", len(manifest_names)
+        )
+    else:
+        manifest_names = list(latent_names)
+        manifest_latents = train_latents.astype(np.float32)
+    seen = set(manifest_names)
+    for n, z, _, _ in lhs_accepted:
+        if n in seen:
+            logging.warning("manifest already contains %s, skipped", n)
+            continue
+        manifest_names.append(n)
+        manifest_latents = np.vstack(
+            [manifest_latents, z.reshape(1, -1).astype(np.float32)]
+        )
+        seen.add(n)
     save_manifest(args.manifest, manifest_names, manifest_latents)
     logging.info(
         "manifest %s: %d shapes", args.manifest, len(manifest_names)
@@ -584,6 +602,10 @@ def main():
     # Task 11 batch mode
     parser.add_argument("--lhs", type=int, default=0,
                         help="batch mode: number of latent-space LHS samples")
+    parser.add_argument("--lhs_offset", type=int, default=0,
+                        help="batch mode: name new samples shape_{offset+i} "
+                        "and merge into an existing manifest (for extending "
+                        "a previous LHS batch instead of overwriting it)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=4,
                         help="concurrent cases in batch mode")

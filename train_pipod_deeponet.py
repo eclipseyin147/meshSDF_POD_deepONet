@@ -30,6 +30,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -70,6 +71,23 @@ from train_pressure_surrogate import (
 )
 
 FIELD_NAMES = ["u", "v", "w", "p"]
+
+
+def make_scheduler(optimizer, args):
+    """LR schedule: 'constant' (default, old behavior) or 'cosine' with a
+    2% warmup and a floor at lr * lr_final_ratio."""
+    if args.lr_schedule == "constant":
+        return None
+    warmup = max(1, int(0.02 * args.iterations))
+
+    def lr_lambda(e):
+        if e < warmup:
+            return (e + 1) / warmup
+        t = min(1.0, (e - warmup) / max(1, args.iterations - warmup))
+        floor = args.lr_final_ratio
+        return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 class MetricsLogger:
@@ -264,26 +282,35 @@ def evaluate_stage1(branch, bases, flat_cases):
 
 
 def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
-                         max_batch=2 ** 18):
+                         max_batch=2 ** 18, near_band=None):
     """Per-shape detached SDF + SDF-gradient features on the reference grid
-    (data-loss branch), cached on the shape dict."""
+    (data-loss branch), cached on the shape dict. With ``near_band`` (an
+    absolute |sdf| threshold), also caches ``s["near_idx"]`` (CPU int64 of
+    grid points within the band) for importance-sampled field losses."""
     spacing = float(grid_points[:, 0].max() - grid_points[:, 0].min())
     spacing /= max(grid_shape[0] - 1, 1)
     for s in shapes:
-        if "sdf" in s:
-            continue
-        sds = []
-        with torch.no_grad():
-            head = 0
-            while head < grid_points.shape[0]:
-                chunk = grid_points[head:head + max_batch]
-                sds.append(deep_sdf.utils.decode_sdf(
-                    decoder, s["latent"], chunk).squeeze(1).float())
-                head += max_batch
-        s["sdf"] = torch.cat(sds, 0)
-        s["sdf_grad"] = compute_sdf_gradients(
-            decoder, s["latent"], grid_points, max_batch)
-        s["h"] = spacing
+        if "sdf" not in s:
+            sds = []
+            with torch.no_grad():
+                head = 0
+                while head < grid_points.shape[0]:
+                    chunk = grid_points[head:head + max_batch]
+                    sds.append(deep_sdf.utils.decode_sdf(
+                        decoder, s["latent"], chunk).squeeze(1).float())
+                    head += max_batch
+            s["sdf"] = torch.cat(sds, 0)
+            s["sdf_grad"] = compute_sdf_gradients(
+                decoder, s["latent"], grid_points, max_batch)
+            s["h"] = spacing
+        if near_band is not None and "near_idx" not in s:
+            near = torch.nonzero(
+                s["sdf"].abs().cpu() < near_band).squeeze(1)
+            if near.numel() == 0:
+                logging.warning("near band %.4g empty for a shape; falling "
+                                "back to uniform sampling for it", near_band)
+            else:
+                s["near_idx"] = near
 
 
 def make_features(grid_points, shape, idx):
@@ -296,6 +323,20 @@ def make_features(grid_points, shape, idx):
         torch.full((n, 1), shape["h"], device=grid_points.device),
     ], dim=1)
 
+
+def sample_field_idx(shape, num_points, n, gen, near_frac=0.0):
+    """Field-loss point indices: ``near_frac`` of the batch from the shape's
+    near-wall band (s["near_idx"], requires build_shape_geometry(near_band)),
+    the rest uniform. near_frac=0 reproduces the old uniform behavior."""
+    n_near = int(n * near_frac)
+    if n_near <= 0 or "near_idx" not in shape:
+        return torch.randint(num_points, (n,), generator=gen)
+    parts = []
+    if n_near < n:
+        parts.append(torch.randint(num_points, (n - n_near,), generator=gen))
+    sel = torch.randint(shape["near_idx"].numel(), (n_near,), generator=gen)
+    parts.append(shape["near_idx"][sel])
+    return torch.cat(parts)
 
 def predict_field(model, shape, bc, grid_points, chunk=2 ** 16):
     """Full-grid field prediction (no_grad, chunked) -> (G, 4)."""
@@ -361,8 +402,11 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
     trunk = TrunkNet(in_dim=8, rank=branch_kwargs["rank"], n_outputs=4,
                      hidden_sizes=tuple(args.trunk_hidden))
     model = PODDeepONet(branch, trunk).to(device)
-    build_shape_geometry(decoder, shapes, grid_points, grid_shape)
+    build_shape_geometry(decoder, shapes, grid_points, grid_shape,
+                         near_band=(args.field_near_band
+                                    if args.field_near_frac > 0 else None))
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
     gen = torch.Generator().manual_seed(args.seed)
     num_points = grid_points.shape[0]
@@ -401,8 +445,8 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
     for e in range(int(args.iterations)):
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
-        idx = torch.randint(num_points, (args.n_field,),
-                            generator=gen).to(device)
+        idx = sample_field_idx(s, num_points, args.n_field, gen,
+                               args.field_near_frac).to(device)
         q = model(s["latent"], c["bc"].unsqueeze(0),
                   make_features(grid_points, s, idx))
         loss_field = ((q - c["fields"][idx]) ** 2).mean(dim=0).sum()
@@ -412,6 +456,8 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
         loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
         loss.backward()
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         loss_num = loss.item()
         if e % 50 == 0:
             if val_cases:
@@ -553,10 +599,13 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
         raise SystemExit("stage 3 requires --init_from <stage2.pth>")
     load_operator_from_checkpoint(model, args.init_from)
     logging.info("initialized operator from {}".format(args.init_from))
-    build_shape_geometry(decoder, shapes, grid_points, grid_shape)
+    build_shape_geometry(decoder, shapes, grid_points, grid_shape,
+                         near_band=(args.field_near_band
+                                    if args.field_near_frac > 0 else None))
     informer = PDEInformer(IncompressibleNS(re=args.re).equations)
     sampler = CollocationSampler(margin=args.margin)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
     gen = torch.Generator().manual_seed(args.seed)
     num_points = grid_points.shape[0]
@@ -601,8 +650,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                else physics_weight_schedule(progress))
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
-        idx = torch.randint(num_points, (args.n_field,),
-                            generator=gen).to(device)
+        idx = sample_field_idx(s, num_points, args.n_field, gen,
+                               args.field_near_frac).to(device)
         q = model(s["latent"], c["bc"].unsqueeze(0),
                   make_features(grid_points, s, idx))
         loss_field = ((q - c["fields"][idx]) ** 2).mean(dim=0).sum()
@@ -634,6 +683,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                               "wall": lw.item(), "far": lf.item()}
         loss.backward()
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         loss_num = loss.item()
         if e % 50 == 0:
             if val_cases:
@@ -676,6 +727,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
 def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
                  train_cases, val_cases, out_dir, rng):
     optimizer = torch.optim.Adam(branch.parameters(), lr=args.lr)
+    scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
     start = time.time()
     loss_num = 0.0
@@ -715,6 +767,8 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
         loss = loss_fn(pred, c["target"].unsqueeze(0))
         loss.backward()
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         loss_num = loss.item()
         if e % 50 == 0:
             if val_cases:
@@ -805,6 +859,11 @@ if __name__ == "__main__":
                         "the full operator (stage 3) from")
     parser.add_argument("--iters", dest="iterations", type=int, default=20000)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"],
+                        default="constant",
+                        help="'constant' (old behavior) or 'cosine' with 2%% "
+                        "warmup decaying to lr*lr_final_ratio at the last iter")
+    parser.add_argument("--lr_final_ratio", type=float, default=0.01)
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--bc_hidden", type=int, default=64)
@@ -817,6 +876,13 @@ if __name__ == "__main__":
                         "0.1 progress schedule of the design doc)")
     parser.add_argument("--re", type=float, default=1e4)
     parser.add_argument("--n_field", type=int, default=16384)
+    parser.add_argument("--field_near_frac", type=float, default=0.0,
+                        help="fraction of each field-loss batch sampled from "
+                        "the shape's near-wall band (0 = old uniform "
+                        "sampling)")
+    parser.add_argument("--field_near_band", type=float, default=0.15,
+                        help="absolute |sdf| threshold of the near-wall band "
+                        "used when field_near_frac > 0")
     parser.add_argument("--n_collocation", type=int, default=4096)
     parser.add_argument("--phys_chunk", type=int, default=1024)
     parser.add_argument("--margin", type=float, default=2.0)
