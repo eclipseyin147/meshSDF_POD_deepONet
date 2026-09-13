@@ -230,6 +230,7 @@ def fit_pod_bases(train_cases, energy, rank, device):
     r = max(b.rank for b in bases) if rank is None else rank
     bases = [pod_fit(S[:, :, v], energy=energy, rank=r, device=device)
              for v in range(4)]
+    bases = [b.cpu() for b in bases]  # (D, r) x4 stays off the GPU
     return bases, r
 
 
@@ -237,8 +238,7 @@ def set_targets(bases, model_cases):
     """True projection coefficients per case: coef (4, r)."""
     for s, c in model_cases:
         c["coef"] = torch.stack([
-            bases[v].project(c["fields"][:, v].unsqueeze(0)
-                             .to(bases[v].mean.device))[0]
+            bases[v].project(c["fields"][:, v].unsqueeze(0))[0]
             for v in range(4)
         ]).detach()
 
@@ -252,8 +252,8 @@ def set_normalizations(branch, train_shapes, train_cases, val_cases):
     branch.set_coef_normalization(train_coefs.mean(0), train_coefs.std(0))
     # 标准化目标对 train 与 val 案例都要设置（val 评估需要 target）
     for _, c in train_cases + val_cases:
-        c["target"] = ((c["coef"] - branch.coef_mean)
-                       / branch.coef_std).detach()
+        c["target"] = ((c["coef"] - branch.coef_mean.cpu())
+                       / branch.coef_std.cpu()).detach()
 
 
 def evaluate_stage1(branch, bases, flat_cases):
@@ -264,12 +264,12 @@ def evaluate_stage1(branch, bases, flat_cases):
     with torch.no_grad():
         for s, c in flat_cases:
             pred_n = branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0))
-            coef_mses.append(loss_fn(pred_n, c["target"].unsqueeze(0)).item())
-            a_pred = branch(s["latent"], c["bc"].unsqueeze(0))  # (1,4,r)
+            coef_mses.append(loss_fn(
+                pred_n, c["target"].unsqueeze(0).to(pred_n.device)).item())
+            a_pred = branch(s["latent"], c["bc"].unsqueeze(0)).cpu()
             errs, ps, bs = [], [], []
             for v in range(4):
-                Y = c["fields"][:, v].unsqueeze(0).to(
-                    bases[v].mean.device)
+                Y = c["fields"][:, v].unsqueeze(0)
                 errs.append(bases[v].relative_error(Y, a_pred[:, v])[0].item())
                 ps.append(bases[v].projection_error(Y)[0].item())
                 bs.append(bases[v].relative_error(
@@ -359,14 +359,14 @@ def evaluate_field(model, bases, flat_cases, grid_points):
     loss_fn = torch.nn.MSELoss()
     rel_l2_v, projs, baselines, coef_mses = [], [], [], []
     for s, c in flat_cases:
-        pred = predict_field(model, s, c["bc"], grid_points)
-        truth = c["fields"].to(grid_points.device)
+        pred = predict_field(model, s, c["bc"], grid_points).cpu()
+        truth = c["fields"]
         per_var = ((pred - truth).pow(2).sum(0)
                    / truth.pow(2).sum(0).clamp_min(1e-30)).sqrt()
         rel_l2_v.append(per_var.cpu())
         coef_mses.append(loss_fn(
             model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
-            c["target"].unsqueeze(0)).item())
+            c["target"].unsqueeze(0).to(grid_points.device)).item())
         ps, bs = [], []
         for v in range(4):
             Y = truth[:, v].unsqueeze(0)
@@ -455,7 +455,7 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
                       ).mean(dim=0).sum()
         loss_pod = loss_fn(
             model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
-            c["target"].unsqueeze(0))
+            c["target"].unsqueeze(0).to(device))
         loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
         loss.backward()
         optimizer.step()
@@ -661,7 +661,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                       ).mean(dim=0).sum()
         loss_pod = loss_fn(
             model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
-            c["target"].unsqueeze(0))
+            c["target"].unsqueeze(0).to(device))
         loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
         phys_terms = {}
         if lam > 0.0:
@@ -768,7 +768,7 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         pred = branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0))
-        loss = loss_fn(pred, c["target"].unsqueeze(0))
+        loss = loss_fn(pred, c["target"].unsqueeze(0).to(pred.device))
         loss.backward()
         optimizer.step()
         if scheduler is not None:
@@ -1009,8 +1009,7 @@ if __name__ == "__main__":
             "train projection error ({}): {:.6e}".format(
                 v, basis.projection_error(torch.stack(
                     [c["fields"][:, FIELD_NAMES.index(v)]
-                     for _, c in train_cases]).to(
-                         basis.mean.device)).mean().item()))
+                     for _, c in train_cases])).mean().item()))
     logging.info("common POD rank r = %d", rank)
     set_targets(bases, train_cases + val_cases)
 
