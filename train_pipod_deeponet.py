@@ -495,15 +495,21 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
 
 
 def physics_losses(model, informer, decoder, latent, bc, points, h,
-                   max_batch):
+                   max_batch, backward_scale=None):
     """Continuity + momentum residuals at collocation points (second-order
     autodiff). d is evaluated through the frozen decoder WITH the graph
     attached; grad d is detached (the ReLU decoder's second derivative
-    vanishes a.e.). Losses accumulate over chunks, normalized by count."""
+    vanishes a.e.). Losses accumulate over chunks, normalized by count.
+
+    Each second-order chunk graph costs ~3 MB/point alive, so graphs must
+    not accumulate across chunks: with ``backward_scale`` each chunk's loss
+    is backwarded immediately (scaled, accumulating into the model's .grad)
+    and the returned (lc, lm) are detached scalars; without it (evaluation)
+    chunk graphs are dropped after their detached contribution is taken."""
     device = points.device
+    n_tot = points.shape[0]
     lc = torch.zeros((), device=device)
     lm = torch.zeros((), device=device)
-    n_tot = 0
     for chunk in points.split(max_batch):
         p = chunk.detach().requires_grad_(True)
         with torch.enable_grad():
@@ -514,9 +520,12 @@ def physics_losses(model, informer, decoder, latent, bc, points, h,
             q = model(latent, bc, feats)
             res = informer({"coordinates": p, "u": q[:, 0:1], "v": q[:, 1:2],
                             "w": q[:, 2:3], "cp": q[:, 3:4]})
-            lc = lc + (res["continuity"] ** 2).sum()
-            lm = lm + sum((res["momentum_" + k] ** 2).sum() for k in "uvw")
-        n_tot += p.shape[0]
+            l_c = (res["continuity"] ** 2).sum()
+            l_m = sum((res["momentum_" + k] ** 2).sum() for k in "uvw")
+            if backward_scale is not None:
+                (backward_scale * (l_c + l_m) / max(n_tot, 1)).backward()
+        lc = lc + l_c.detach()
+        lm = lm + l_m.detach()
     return lc / max(n_tot, 1), lm / max(n_tot, 1)
 
 
@@ -674,15 +683,17 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                                 "physics".format(c["case_id"]))
                 picks = None
             if picks is not None:
+                # physics residuals backward per chunk (scaled by lam) so at
+                # most one second-order graph is alive at a time
                 lc, lm = physics_losses(
                     model, informer, decoder, s["latent"],
                     c["bc"].unsqueeze(0),
                     grid_points[picks["collocation"]], s["h"],
-                    args.phys_chunk)
+                    args.phys_chunk, backward_scale=lam)
                 lw, lf = boundary_losses(model, s, c["bc"], grid_points,
                                          picks["wall"], picks["far"],
                                          args.wall_bc)
-                loss = loss + lam * (lc + lm + lw + lf)
+                loss = loss + lam * (lw + lf)
                 phys_terms = {"cont": lc.item(), "mom": lm.item(),
                               "wall": lw.item(), "far": lf.item()}
         loss.backward()
@@ -690,6 +701,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
         if scheduler is not None:
             scheduler.step()
         loss_num = loss.item()
+        if phys_terms:
+            loss_num += lam * (lc + lm).item()  # log incl. detached physics
         if e % 50 == 0:
             if val_cases:
                 metrics = evaluate_physics(model, informer, decoder, bases,
