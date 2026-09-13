@@ -208,9 +208,10 @@ reconstruct_mesh.py             # 新增：网格级 Chamfer 重建（--field_ty
 refine_silhouette.py            # 新增：剪影精修（--view_index/--image_size/--sigma/--field_type）
 train_pressure_surrogate.py     # 新增：压力代理训练（--model local|operator/--openfoam/--cp_data）
 train_volume_rom.py             # 新增：体积场 POD-ROM 训练（--snapshots|--synthetic）
-train_pipod_deeponet.py         # 新增：PIPOD-DeepONet 三阶段训练（--stage 1|2|3、
-                                #   --snapshots/--synthetic、--latent_manifest、
-                                #   --wall_bc、--re、--lambda_phys；JSONL 指标日志）
+train_pipod_deeponet.py         # 新增：PIPOD-DeepONet 三阶段训练（--config JSON 或
+                                #   CLI：--stage 1|2|3、--snapshots/--synthetic、
+                                #   --latent_manifest、--wall_bc、--re、--lambda_phys；
+                                #   JSONL 指标日志）
 generate_openfoam_snapshots.py  # 新增：OpenFOAM 批量快照（--lhs N 形状采样、
                                 #   4 路并行、batch_summary.json 汇总）
 optimize_drag.py                # 新增：气动降阻优化（--latent/--reg_lambda/--bounds）
@@ -423,6 +424,18 @@ points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], 1)  # (G,3)，即 fields
 **OpenFOAM 侧建议**：在 case 内配 `sampleDict`/`postProcess` 让求解器直接在上述探针点输出 (u, p)（按同一行序），再组装 npz，避免二次插值误差。
 
 #### PIPOD-DeepONet 三阶段训练（§2.8）
+
+推荐用 JSON 配置（`--config`，避免三阶段间抄错数据参数；顶层键 = 任意 CLI flag 的默认值，`stages` 列表放逐阶段覆盖，CLI 仍最优先；`--stage N>1` 且未给 `--init_from` 时自动链到 `PipodONet/stage<N-1>.pth`；解析后的完整参数存档到 `PipodONet/config_stage<N>.json`）：
+
+```bash
+# 合成场（examples/ellipsoids/pipod_config.json，复现 §6.7 合成线）
+.venv/bin/python train_pipod_deeponet.py --config examples/ellipsoids/pipod_config.json --stage 1
+# OpenFOAM 真实场（examples/ellipsoids_of/pipod_config.json，含 --snapshots +
+# --latent_manifest、stage3 自动 lr 1e-4 + wall_bc noslip + re 150）
+.venv/bin/python train_pipod_deeponet.py --config examples/ellipsoids_of/pipod_config.json --stage 3
+```
+
+等价的纯 CLI 形式（与旧行为一致，config 文件就是从它收敛来的）：
 
 ```bash
 # 合成场（--synthetic，势流 + 尾迹；同 split/seed 下快照自动复用）

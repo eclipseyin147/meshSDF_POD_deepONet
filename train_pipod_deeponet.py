@@ -746,10 +746,35 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
 
 
 if __name__ == "__main__":
+    # Pass 1: --config / --stage only, so the JSON can seed parser defaults
+    # (CLI flags still override; see pass 2 below).
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None,
+                     help="JSON config: top-level keys are defaults for any "
+                     "CLI flag (dest or dashed name); an optional \"stages\" "
+                     "list holds per-stage overrides selected by --stage")
+    pre.add_argument("--stage", type=int, default=None)
+    pre_args, _ = pre.parse_known_args()
+
+    cfg = {}
+    if pre_args.config:
+        raw = json.load(open(pre_args.config))
+        stage_no = pre_args.stage or raw.get("stage", 1)
+        stages = {int(s["stage"]): s for s in raw.pop("stages", [])}
+        raw.pop("stage", None)
+        cfg.update(raw)
+        if stage_no in stages:
+            cfg.update({k: v for k, v in stages[stage_no].items()
+                        if k != "stage"})
+        cfg["stage"] = stage_no
+
     parser = argparse.ArgumentParser(
         description="Train the physics-informed POD-DeepONet volume operator "
         "(staged: 1 coefficients, 2 field, 3 physics fine-tuning)."
     )
+    parser.add_argument("--config", default=None,
+                        help="JSON config file (see pass-1 help); CLI flags "
+                        "override config values")
     parser.add_argument("--experiment", "-e", dest="experiment_directory",
                         required=True)
     parser.add_argument("--checkpoint", "-c", dest="checkpoint",
@@ -802,8 +827,37 @@ if __name__ == "__main__":
                         type=int, default=800)
     parser.add_argument("--seed", type=int, default=0)
     deep_sdf.add_common_args(parser)
+
+    if cfg:
+        aliases = {"experiment": "experiment_directory",
+                   "data": "data_source",
+                   "split": "split_filename",
+                   "iters": "iterations"}
+        actions = {a.dest: a for a in parser._actions}
+        resolved, unknown = {}, []
+        for k, v in cfg.items():
+            dest = aliases.get(k, k)
+            (resolved.__setitem__(dest, v) if dest in actions
+             else unknown.append(k))
+        if unknown:
+            raise RuntimeError("config key(s) not matching any CLI flag: "
+                               + ", ".join(sorted(unknown)))
+        parser.set_defaults(**resolved)
+        for dest in ("experiment_directory", "data_source", "split_filename"):
+            if dest in resolved:
+                actions[dest].required = False
     args = parser.parse_args()
     deep_sdf.configure_logging(args)
+
+    # Stage chaining: default --init_from to the previous stage checkpoint.
+    if args.config and args.stage > 1 and args.init_from is None:
+        chained = os.path.join(args.experiment_directory, "PipodONet",
+                               f"stage{args.stage - 1}.pth")
+        if os.path.isfile(chained):
+            args.init_from = chained
+        else:
+            logging.warning("stage %d: chained checkpoint %s not found; "
+                            "pass --init_from explicitly", args.stage, chained)
 
     if bool(args.snapshots) == bool(args.synthetic):
         raise RuntimeError("pass exactly one of --snapshots <dir> or --synthetic")
@@ -840,6 +894,13 @@ if __name__ == "__main__":
     device = torch.device("cuda")
     out_dir = os.path.join(args.experiment_directory, "PipodONet")
     os.makedirs(out_dir, exist_ok=True)
+    if args.config:
+        with open(os.path.join(out_dir, f"config_stage{args.stage}.json"),
+                  "w") as f:
+            json.dump({k: v for k, v in vars(args).items()
+                       if isinstance(v, (int, float, str, bool, list))
+                       or v is None}, f, indent=1, sort_keys=True)
+            f.write("\n")
     snapshots_dir = (args.snapshots if args.snapshots
                      else os.path.join(out_dir, "snapshots"))
     if args.synthetic:
