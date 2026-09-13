@@ -197,7 +197,7 @@ def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
                         "snapshot {} belongs to shape {}, expected {}".format(
                             path, snap["shape"], npz))
                 cases.append({"bc": snap["bc"].to(device),
-                              "fields": snap["fields"].to(device),
+                              "fields": snap["fields"],  # CPU: moved per-use
                               "case_id": os.path.basename(path)})
         else:
             paths = snap_index.get(npz)
@@ -208,11 +208,11 @@ def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
             for path in paths:
                 snap = load_snapshot(path, num_points)
                 cases.append({"bc": snap["bc"].to(device),
-                              "fields": snap["fields"].to(device),
+                              "fields": snap["fields"],  # CPU: moved per-use
                               "case_id": os.path.basename(path)})
         for c in cases:
             c["fields"] = c["fields"].clone()
-            c["fields"][:, :3] /= c["bc"][0]  # nondimensionalize velocity
+            c["fields"][:, :3] /= c["bc"][0].cpu()  # nondim. velocity
         shapes.append({"name": npz, "latent": latent.detach(),
                        "cases": cases})
     if not shapes:
@@ -237,7 +237,8 @@ def set_targets(bases, model_cases):
     """True projection coefficients per case: coef (4, r)."""
     for s, c in model_cases:
         c["coef"] = torch.stack([
-            bases[v].project(c["fields"][:, v].unsqueeze(0))[0]
+            bases[v].project(c["fields"][:, v].unsqueeze(0)
+                             .to(bases[v].mean.device))[0]
             for v in range(4)
         ]).detach()
 
@@ -267,7 +268,8 @@ def evaluate_stage1(branch, bases, flat_cases):
             a_pred = branch(s["latent"], c["bc"].unsqueeze(0))  # (1,4,r)
             errs, ps, bs = [], [], []
             for v in range(4):
-                Y = c["fields"][:, v].unsqueeze(0)
+                Y = c["fields"][:, v].unsqueeze(0).to(
+                    bases[v].mean.device)
                 errs.append(bases[v].relative_error(Y, a_pred[:, v])[0].item())
                 ps.append(bases[v].projection_error(Y)[0].item())
                 bs.append(bases[v].relative_error(
@@ -358,7 +360,7 @@ def evaluate_field(model, bases, flat_cases, grid_points):
     rel_l2_v, projs, baselines, coef_mses = [], [], [], []
     for s, c in flat_cases:
         pred = predict_field(model, s, c["bc"], grid_points)
-        truth = c["fields"]
+        truth = c["fields"].to(grid_points.device)
         per_var = ((pred - truth).pow(2).sum(0)
                    / truth.pow(2).sum(0).clamp_min(1e-30)).sqrt()
         rel_l2_v.append(per_var.cpu())
@@ -446,10 +448,11 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         idx = sample_field_idx(s, num_points, args.n_field, gen,
-                               args.field_near_frac).to(device)
+                               args.field_near_frac)
         q = model(s["latent"], c["bc"].unsqueeze(0),
-                  make_features(grid_points, s, idx))
-        loss_field = ((q - c["fields"][idx]) ** 2).mean(dim=0).sum()
+                  make_features(grid_points, s, idx.to(device)))
+        loss_field = ((q - c["fields"][idx].to(device)) ** 2
+                      ).mean(dim=0).sum()
         loss_pod = loss_fn(
             model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
             c["target"].unsqueeze(0))
@@ -559,8 +562,8 @@ def evaluate_physics(model, informer, decoder, bases, val_cases, grid_points,
     for s, c in val_cases:
         try:
             picks = sampler.sample(grid_points, grid_shape, s["sdf"],
-                                   c["fields"], c["bc"], args.n_collocation,
-                                   gen)
+                                   c["fields"].to(device), c["bc"],
+                                   args.n_collocation, gen)
         except FluidMaskEmpty:
             continue
         with torch.enable_grad():
@@ -651,10 +654,11 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         idx = sample_field_idx(s, num_points, args.n_field, gen,
-                               args.field_near_frac).to(device)
+                               args.field_near_frac)
         q = model(s["latent"], c["bc"].unsqueeze(0),
-                  make_features(grid_points, s, idx))
-        loss_field = ((q - c["fields"][idx]) ** 2).mean(dim=0).sum()
+                  make_features(grid_points, s, idx.to(device)))
+        loss_field = ((q - c["fields"][idx].to(device)) ** 2
+                      ).mean(dim=0).sum()
         loss_pod = loss_fn(
             model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
             c["target"].unsqueeze(0))
@@ -663,7 +667,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
         if lam > 0.0:
             try:
                 picks = sampler.sample(grid_points, grid_shape, s["sdf"],
-                                       c["fields"], c["bc"],
+                                       c["fields"].to(device), c["bc"],
                                        args.n_collocation, gen)
             except FluidMaskEmpty:
                 logging.warning("case {} has no fluid points; skipping "
@@ -1005,7 +1009,8 @@ if __name__ == "__main__":
             "train projection error ({}): {:.6e}".format(
                 v, basis.projection_error(torch.stack(
                     [c["fields"][:, FIELD_NAMES.index(v)]
-                     for _, c in train_cases])).mean().item()))
+                     for _, c in train_cases]).to(
+                         basis.mean.device)).mean().item()))
     logging.info("common POD rank r = %d", rank)
     set_targets(bases, train_cases + val_cases)
 
