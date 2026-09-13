@@ -214,6 +214,8 @@ train_pipod_deeponet.py         # 新增：PIPOD-DeepONet 三阶段训练（--co
                                 #   JSONL 指标日志）
 generate_openfoam_snapshots.py  # 新增：OpenFOAM 批量快照（--lhs N 形状采样、
                                 #   4 路并行、batch_summary.json 汇总）
+plot_pipod_metrics.py           # 新增：PIPOD 三阶段指标曲线（读 metrics_stageN.jsonl，
+                                #   --overlay 双实验对比、-w 训练中实时刷新）
 optimize_drag.py                # 新增：气动降阻优化（--latent/--reg_lambda/--bounds）
 server.py                       # 新增：FastAPI + WebSocket 实时 latent 探索服务
 web/                            # 新增：three.js 前端（index.html + app.js，CDN 引入无构建）
@@ -455,7 +457,7 @@ points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], 1)  # (G,3)，即 fields
 # stage 3 同上 + --init_from .../stage2.pth --lr 1e-4 --wall_bc noslip --re 150
 ```
 
-输出：`<experiment>/PipodONet/`：`pod_basis_{u,v,w,p}.pth`（cPOD 逐变量基 + 均值场 + 奇异值，仅 train 案例拟合）、`stage1/2/3.pth`（best-on-val；含 model_kwargs / rank / re / val 指标 / seed）、`metrics_stage<1|2|3>.jsonl`（每 50 iter 一条评估记录，含 val 系数 MSE、全场相对 L2（逐变量）、projection 下界、均值基线，stage 3 另有 val continuity/momentum/wall 残差与 λ_phys）。`--latent_manifest` 与 `--synthetic` 互斥。
+输出：`<experiment>/PipodONet/`：`pod_basis_{u,v,w,p}.pth`（cPOD 逐变量基 + 均值场 + 奇异值，仅 train 案例拟合）、`stage1/2/3.pth`（best-on-val；含 model_kwargs / rank / re / val 指标 / seed）、`metrics_stage<1|2|3>.jsonl`（每 50 iter 一条评估记录，含 val 系数 MSE、全场相对 L2（逐变量）、projection 下界、均值基线，stage 3 另有 val continuity/momentum/wall 残差与 λ_phys）。`--latent_manifest` 与 `--synthetic` 互斥。训练曲线可视化：`plot_pipod_metrics.py -e <experiment>`（出 `metrics.png`；`--overlay <exp2>` 叠加对比、`-w 30` 训练中每 30 s 实时刷新）。
 
 #### OpenFOAM 快照批量生成（§6.7 数据线）
 
