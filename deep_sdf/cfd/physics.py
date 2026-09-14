@@ -196,11 +196,16 @@ class CollocationSampler:
         self.grad_quantile = grad_quantile
         self.far_sdf = far_sdf
 
-    def _pools(self, grid_points, grid_shape, sdf, fields, bc):
+    def _pools(self, grid_points, grid_shape, sdf, fields, bc, spacing=None):
         n = grid_shape[0]
-        spacing = float(grid_points[:, 0].max() - grid_points[:, 0].min())
-        spacing /= max(n - 1, 1)
         device = grid_points.device
+        if spacing is None:
+            # legacy uniform grid: scalar spacing
+            spacing = float(grid_points[:, 0].max() - grid_points[:, 0].min())
+            spacing = torch.full((grid_points.shape[0],),
+                                 spacing / max(n - 1, 1), device=device)
+        else:
+            spacing = spacing.to(device)
         fluid = fluid_mask(sdf, self.margin * spacing)
         if not fluid.any():
             raise FluidMaskEmpty("no fluid points (sdf > margin*h)")
@@ -214,13 +219,18 @@ class CollocationSampler:
         xi = rel @ d
         rho2 = ((rel - xi.unsqueeze(1) * d) ** 2).sum(dim=1)
         wake = fluid & (xi > self.wake_xi_min) & (rho2 < self.wake_rho_max ** 2)
+        # |grad u| by central differences; works for non-uniform tensor grids
+        ax = [torch.unique(grid_points[:, i]).sort().values for i in range(3)]
         vel = fields[:, :3].reshape(n, n, n, 3)
         gx = torch.zeros_like(vel)
         gy = torch.zeros_like(vel)
         gz = torch.zeros_like(vel)
-        gx[1:-1] = (vel[2:] - vel[:-2]) / (2 * spacing)
-        gy[:, 1:-1] = (vel[:, 2:] - vel[:, :-2]) / (2 * spacing)
-        gz[:, :, 1:-1] = (vel[:, :, 2:] - vel[:, :, :-2]) / (2 * spacing)
+        dx = (ax[0][2:] - ax[0][:-2]).reshape(-1, 1, 1, 1)
+        dy = (ax[1][2:] - ax[1][:-2]).reshape(1, -1, 1, 1)
+        dz = (ax[2][2:] - ax[2][:-2]).reshape(1, 1, -1, 1)
+        gx[1:-1] = (vel[2:] - vel[:-2]) / dx
+        gy[:, 1:-1] = (vel[:, 2:] - vel[:, :-2]) / dy
+        gz[:, :, 1:-1] = (vel[:, :, 2:] - vel[:, :, :-2]) / dz
         gmag = (gx ** 2 + gy ** 2 + gz ** 2).sum(dim=-1).sqrt().reshape(-1)
         thresh = torch.quantile(gmag[fluid], self.grad_quantile)
         high_grad = fluid & (gmag >= thresh)
@@ -243,10 +253,12 @@ class CollocationSampler:
         return pool[sel.to(pool.device)]
 
     def sample(self, grid_points, grid_shape, sdf, fields, bc, n_points,
-               generator):
+               generator, spacing=None):
         """-> {"collocation": (n_points,), "wall": (n_points//8,),
-        "far": (n_points//8,)} index tensors."""
-        pools = self._pools(grid_points, grid_shape, sdf, fields, bc)
+        "far": (n_points//8,)} index tensors. ``spacing``: optional
+        per-point local cell size (G,) for stretched grids."""
+        pools = self._pools(grid_points, grid_shape, sdf, fields, bc,
+                            spacing=spacing)
         counts = [int(f * n_points) for f in self.fractions[:-1]]
         counts.append(n_points - sum(counts))
         keys = ("near_wall", "wake", "high_grad", "uniform")

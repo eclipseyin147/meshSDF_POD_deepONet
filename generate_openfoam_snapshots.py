@@ -67,6 +67,7 @@ from deep_sdf.cfd.labels import export_stl
 from deep_sdf.cfd.volume import (
     load_snapshot,
     make_reference_grid,
+    make_stretched_grid,
     snapshot_filename,
 )
 from train_pressure_surrogate import make_bc, sample_flow_direction
@@ -454,7 +455,10 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         "manifest %s: %d shapes", args.manifest, len(manifest_names)
     )
 
-    # per-shape STL + SDF mask
+    # per-shape STL + SDF mask. Shape set = 27 analytic ellipsoids (unless
+    # skipped) + newly accepted LHS samples + LHS shapes carried over from
+    # a pre-existing manifest (e.g. re-running an earlier batch in a new
+    # root without re-sampling).
     stl_dir = os.path.join(args.root, "stls")
     os.makedirs(stl_dir, exist_ok=True)
     shape_infos = []
@@ -473,6 +477,19 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         export_stl(verts, faces, stl)
         mask = openfoam_runner.decoder_sdf_mask(decoder, z, grid_points)
         shape_infos.append({"name": name, "stl": stl, "sdf_mask": mask})
+    # carried-over LHS shapes from a merged manifest (already validated)
+    fresh = {n for n, _, _, _ in lhs_accepted}
+    for n, z in zip(manifest_names, manifest_latents):
+        if n in latent_names or n in fresh:
+            continue
+        stl = _stl_cache_path(stl_dir, n)
+        if not os.path.isfile(stl):
+            verts, faces = openfoam_runner.mesh_from_latent(
+                decoder, z, resolution=63
+            )
+            export_stl(verts, faces, stl)
+        mask = openfoam_runner.decoder_sdf_mask(decoder, z, grid_points)
+        shape_infos.append({"name": n, "stl": stl, "sdf_mask": mask})
     logging.info("batch shapes: %d", len(shape_infos))
 
     template_dir = os.path.join(args.root, "template_case")
@@ -482,9 +499,12 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
     specs = []
     skipped = []
     for info in shape_infos:
-        bcs = sample_case_bcs(
-            args.seed, info["name"], args.cases_per_shape, args.u_range
-        )
+        if args.fixed_bc is not None:
+            bcs = [np.asarray(args.fixed_bc, dtype=np.float32)]
+        else:
+            bcs = sample_case_bcs(
+                args.seed, info["name"], args.cases_per_shape, args.u_range
+            )
         for case_idx, bc in enumerate(bcs):
             snap_name = snapshot_filename(info["name"], case_idx)
             out_path = os.path.join(snapshots_root, snap_name)
@@ -594,6 +614,10 @@ def main():
         help="output root (cases/ and snapshots/ are created inside)",
     )
     parser.add_argument("--grid_resolution", type=int, default=64)
+    parser.add_argument("--grid_stretch", action="store_true",
+                        help="sample on the fixed anisotropic stretched grid "
+                        "(dense near the body) instead of the uniform grid")
+    parser.add_argument("--grid_h_fine", type=float, default=0.027)
     parser.add_argument("--grid_domain", type=float, nargs=2,
                         default=(-1.5, 1.5))
     parser.add_argument("--n_procs", type=int, default=1,
@@ -611,6 +635,10 @@ def main():
                         help="concurrent cases in batch mode")
     parser.add_argument("--cases_per_shape", type=int, default=4)
     parser.add_argument("--u_range", type=float, nargs=2, default=(10.0, 20.0))
+    parser.add_argument("--fixed_bc", type=float, nargs=4, default=None,
+                        metavar=("U", "DX", "DY", "DZ"),
+                        help="one case per shape with this exact bc "
+                        "(overrides --cases_per_shape/--u_range sampling)")
     parser.add_argument(
         "--experiment",
         default=os.path.join(
@@ -662,9 +690,13 @@ def main():
     os.makedirs(cases_root, exist_ok=True)
     os.makedirs(snapshots_root, exist_ok=True)
 
-    grid_points, grid_shape = make_reference_grid(
-        args.grid_resolution, tuple(args.grid_domain)
-    )
+    if args.grid_stretch:
+        grid_points, grid_shape, _ = make_stretched_grid(
+            hi=args.grid_domain[1], h_fine=args.grid_h_fine)
+    else:
+        grid_points, grid_shape = make_reference_grid(
+            args.grid_resolution, tuple(args.grid_domain)
+        )
     logging.info(
         "reference grid %s (%d points)", grid_shape, grid_points.shape[0]
     )

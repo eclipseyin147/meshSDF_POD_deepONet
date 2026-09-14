@@ -58,6 +58,8 @@ from deep_sdf.cfd.physics import (
 from deep_sdf.cfd.volume import (
     load_snapshot,
     make_reference_grid,
+    make_stretched_grid,
+    grid_point_spacing,
     pod_fit,
     save_snapshot,
     snapshot_filename,
@@ -284,7 +286,7 @@ def evaluate_stage1(branch, bases, flat_cases):
 
 
 def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
-                         max_batch=2 ** 18, near_band=None):
+                         max_batch=2 ** 18, near_band=None, h_grid=None):
     """Per-shape detached SDF + SDF-gradient features on the reference grid
     (data-loss branch), cached on the shape dict. With ``near_band`` (an
     absolute |sdf| threshold), also caches ``s["near_idx"]`` (CPU int64 of
@@ -301,10 +303,12 @@ def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
                     sds.append(deep_sdf.utils.decode_sdf(
                         decoder, s["latent"], chunk).squeeze(1).float())
                     head += max_batch
-            s["sdf"] = torch.cat(sds, 0)
+            s["sdf"] = torch.cat(sds, 0).cpu()  # CPU: slices moved per-use
             s["sdf_grad"] = compute_sdf_gradients(
-                decoder, s["latent"], grid_points, max_batch)
+                decoder, s["latent"], grid_points, max_batch).cpu()
             s["h"] = spacing
+            if h_grid is not None:
+                s["h_grid"] = h_grid  # shared (G,) CPU tensor
         if near_band is not None and "near_idx" not in s:
             near = torch.nonzero(
                 s["sdf"].abs().cpu() < near_band).squeeze(1)
@@ -316,13 +320,21 @@ def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
 
 
 def make_features(grid_points, shape, idx):
-    """(n, 8) trunk features [x, y, z, sdf, dsdf/dx, dsdf/dy, dsdf/dz, h]."""
+    """(n, 8) trunk features [x, y, z, sdf, dsdf/dx, dsdf/dy, dsdf/dz, h].
+    sdf/grad (and h on stretched grids) live on the CPU; only the indexed
+    slice is moved."""
     n = idx.numel()
+    idx_c = idx.cpu()
+    device = grid_points.device
+    if "h_grid" in shape:
+        h = shape["h_grid"][idx_c].unsqueeze(1).to(device)
+    else:
+        h = torch.full((n, 1), shape["h"], device=device)
     return torch.cat([
         grid_points[idx],
-        shape["sdf"][idx].unsqueeze(1),
-        shape["sdf_grad"][idx],
-        torch.full((n, 1), shape["h"], device=grid_points.device),
+        shape["sdf"][idx_c].unsqueeze(1).to(device),
+        shape["sdf_grad"][idx_c].to(device),
+        h,
     ], dim=1)
 
 
@@ -406,7 +418,8 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
     model = PODDeepONet(branch, trunk).to(device)
     build_shape_geometry(decoder, shapes, grid_points, grid_shape,
                          near_band=(args.field_near_band
-                                    if args.field_near_frac > 0 else None))
+                                    if args.field_near_frac > 0 else None),
+                         h_grid=h_grid)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
@@ -510,13 +523,18 @@ def physics_losses(model, informer, decoder, latent, bc, points, h,
     n_tot = points.shape[0]
     lc = torch.zeros((), device=device)
     lm = torch.zeros((), device=device)
-    for chunk in points.split(max_batch):
+    for lo in range(0, n_tot, max_batch):
+        chunk = points[lo:lo + max_batch]
         p = chunk.detach().requires_grad_(True)
         with torch.enable_grad():
             d = deep_sdf.utils.decode_sdf(decoder, latent, p)
             g = torch.autograd.grad(d.sum(), p, create_graph=True)[0]
+            if torch.is_tensor(h):
+                hc = h[lo:lo + p.shape[0]].to(p.device)
+            else:
+                hc = torch.full_like(d, h)
             feats = torch.cat(
-                [p, d, g.detach(), torch.full_like(d, h)], dim=1)
+                [p, d, g.detach(), hc], dim=1)
             q = model(latent, bc, feats)
             res = informer({"coordinates": p, "u": q[:, 0:1], "v": q[:, 1:2],
                             "w": q[:, 2:3], "cp": q[:, 3:4]})
@@ -539,7 +557,7 @@ def boundary_losses(model, shape, bc, grid_points, idx_wall, idx_far,
         q_w = model(shape["latent"], bc.unsqueeze(0),
                     make_features(grid_points, shape, idx_wall))
         if wall_bc == "slip":
-            n_w = shape["sdf_grad"][idx_wall]
+            n_w = shape["sdf_grad"][idx_wall.cpu()].to(grid_points.device)
             n_w = n_w / n_w.norm(dim=1, keepdim=True).clamp_min(1e-12)
             l_wall = wall_slip_loss(q_w, n_w)
         else:
@@ -570,23 +588,28 @@ def evaluate_physics(model, informer, decoder, bases, val_cases, grid_points,
     gen = torch.Generator().manual_seed(args.seed + 12345)  # 固定评估集
     for s, c in val_cases:
         try:
-            picks = sampler.sample(grid_points, grid_shape, s["sdf"],
+            picks = sampler.sample(grid_points, grid_shape,
+                                   s["sdf"].to(device),
                                    c["fields"].to(device), c["bc"],
-                                   args.n_collocation, gen)
+                                   args.n_collocation, gen,
+                                   spacing=s.get("h_grid"))
         except FluidMaskEmpty:
             continue
         with torch.enable_grad():
-            lc, lm = physics_losses(model, informer, decoder, s["latent"],
-                                    c["bc"].unsqueeze(0),
-                                    grid_points[picks["collocation"]], s["h"],
-                                    args.phys_chunk)
+            lc, lm = physics_losses(
+                model, informer, decoder, s["latent"],
+                c["bc"].unsqueeze(0),
+                grid_points[picks["collocation"]],
+                (s["h_grid"][picks["collocation"].cpu()].unsqueeze(1)
+                 if "h_grid" in s else s["h"]),
+                args.phys_chunk)
         conts.append(lc.sqrt().item())
         moms.append(lm.sqrt().item())
         if picks["wall"].numel():
             with torch.no_grad():
                 q_w = model(s["latent"], c["bc"].unsqueeze(0),
                             make_features(grid_points, s, picks["wall"]))
-                n_w = s["sdf_grad"][picks["wall"]]
+                n_w = s["sdf_grad"][picks["wall"].cpu()].to(device)
                 n_w = n_w / n_w.norm(dim=1, keepdim=True).clamp_min(1e-12)
                 walls.append(
                     ((q_w[:, :3] * n_w).sum(1).abs()
@@ -613,7 +636,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
     logging.info("initialized operator from {}".format(args.init_from))
     build_shape_geometry(decoder, shapes, grid_points, grid_shape,
                          near_band=(args.field_near_band
-                                    if args.field_near_frac > 0 else None))
+                                    if args.field_near_frac > 0 else None),
+                         h_grid=h_grid)
     informer = PDEInformer(IncompressibleNS(re=args.re).equations)
     sampler = CollocationSampler(margin=args.margin)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -675,9 +699,11 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
         phys_terms = {}
         if lam > 0.0:
             try:
-                picks = sampler.sample(grid_points, grid_shape, s["sdf"],
+                picks = sampler.sample(grid_points, grid_shape,
+                                       s["sdf"].to(device),
                                        c["fields"].to(device), c["bc"],
-                                       args.n_collocation, gen)
+                                       args.n_collocation, gen,
+                                       spacing=s.get("h_grid"))
             except FluidMaskEmpty:
                 logging.warning("case {} has no fluid points; skipping "
                                 "physics".format(c["case_id"]))
@@ -688,7 +714,9 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                 lc, lm = physics_losses(
                     model, informer, decoder, s["latent"],
                     c["bc"].unsqueeze(0),
-                    grid_points[picks["collocation"]], s["h"],
+                    grid_points[picks["collocation"]],
+                    (s["h_grid"][picks["collocation"].cpu()].unsqueeze(1)
+                     if "h_grid" in s else s["h"]),
                     args.phys_chunk, backward_scale=lam)
                 lw, lf = boundary_losses(model, s, c["bc"], grid_points,
                                          picks["wall"], picks["far"],
@@ -863,6 +891,14 @@ if __name__ == "__main__":
                         "exclusive with --synthetic")
     parser.add_argument("--synthetic", dest="synthetic", action="store_true")
     parser.add_argument("--grid_resolution", type=int, default=64)
+    parser.add_argument("--grid_stretch", action="store_true",
+                        help="use the fixed anisotropic stretched grid "
+                        "(dense near the body, coarse far-field) instead of "
+                        "the uniform grid_resolution grid")
+    parser.add_argument("--grid_domain_hi", type=float, default=1.5)
+    parser.add_argument("--grid_dense_half", type=float, default=1.35)
+    parser.add_argument("--grid_h_fine", type=float, default=0.027)
+    parser.add_argument("--grid_growth", type=float, default=1.35)
     parser.add_argument("--pod_energy", type=float, default=0.999)
     parser.add_argument("--pod_rank", type=int, default=None)
     parser.add_argument("--cases_per_shape", type=int, default=4)
@@ -989,7 +1025,17 @@ if __name__ == "__main__":
     if args.synthetic:
         os.makedirs(snapshots_dir, exist_ok=True)
 
-    grid_points, grid_shape = make_reference_grid(args.grid_resolution)
+    if args.grid_stretch:
+        grid_points, grid_shape, grid_axis = make_stretched_grid(
+            hi=args.grid_domain_hi, dense_half=args.grid_dense_half,
+            h_fine=args.grid_h_fine, growth=args.grid_growth)
+        h_grid = grid_point_spacing(grid_shape, grid_axis)  # (G,) CPU
+        logging.info("stretched grid: %s = %d points, spacing %.4f..%.4f",
+                     grid_shape, grid_points.shape[0],
+                     h_grid.min().item(), h_grid.max().item())
+    else:
+        grid_points, grid_shape = make_reference_grid(args.grid_resolution)
+        h_grid = None
     grid_points = grid_points.to(device)
     num_points = grid_points.shape[0]
 

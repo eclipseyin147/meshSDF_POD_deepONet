@@ -72,6 +72,64 @@ def make_reference_grid(resolution=64, domain=(-1.5, 1.5)):
     return grid_points, (n, n, n)
 
 
+def stretched_axis_coords(hi=1.5, dense_half=1.35, h_fine=0.027,
+                          growth=1.35):
+    """1D stretched grid coordinates on [-hi, hi]: uniform spacing
+    ``h_fine`` inside [-dense_half, dense_half], then geometric growth
+    (ratio ``growth``) out to hi. Symmetric around 0."""
+    pts = [0.0]
+    x = 0.0
+    while x + h_fine <= dense_half + 1e-12:
+        x += h_fine
+        pts.append(x)
+    h = h_fine
+    while x < hi - 1e-12:
+        h *= growth
+        x = min(x + h, hi)
+        pts.append(x)
+    neg = [-p for p in reversed(pts[1:])]
+    return np.array(neg + pts)
+
+
+def make_stretched_grid(hi=1.5, dense_half=1.35, h_fine=0.027,
+                        growth=1.35):
+    """Fixed anisotropic reference grid (dual-resolution): dense near the
+    body, coarse at the far field - one tensor-product grid, so every case
+    shares the same point set (POD column alignment preserved).
+
+    Returns
+    -------
+    grid_points : torch.Tensor
+        (G, 3) float32, C-order flattened (x slowest, z fastest).
+    shape : (int, int, int)
+    axis : numpy.ndarray
+        The 1D stretched coordinates (same for every axis).
+    """
+    axis = stretched_axis_coords(hi, dense_half, h_fine, growth)
+    n = len(axis)
+    lin = torch.as_tensor(axis, dtype=torch.float32)
+    xx, yy, zz = torch.meshgrid(lin, lin, lin, indexing="ij")
+    grid_points = torch.stack(
+        [xx.reshape(-1), yy.reshape(-1), zz.reshape(-1)], dim=1
+    )
+    return grid_points, (n, n, n), axis
+
+
+def grid_point_spacing(shape, axis):
+    """Per-point local spacing (G,) float32: cube root of the local cell
+    volume hx*hy*hz (central differences, one-sided at the boundaries)."""
+    a = np.asarray(axis, dtype=np.float64)
+    d = np.empty_like(a)
+    d[1:-1] = (a[2:] - a[:-2]) / 2.0
+    d[0] = a[1] - a[0]
+    d[-1] = a[-1] - a[-2]
+    dd = torch.as_tensor(d, dtype=torch.float32)
+    hx = dd.reshape(-1, 1, 1).expand(shape)
+    hy = dd.reshape(1, -1, 1).expand(shape)
+    hz = dd.reshape(1, 1, -1).expand(shape)
+    return (hx * hy * hz).reshape(-1) ** (1.0 / 3.0)
+
+
 def snapshot_filename(npz, case_idx):
     """Snapshot file name for a (shape, case) pair."""
     return npz[:-4].replace("/", "_") + "_case{:03d}.npz".format(case_idx)
