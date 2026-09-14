@@ -92,16 +92,55 @@ def make_scheduler(optimizer, args):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def save_train_state(path, model, optimizer, e, best):
+    """Periodic full training state (model + optimizer + iter + best) so
+    --resume can continue a stage loss-free, e.g. after raising --iters."""
+    torch.save({
+        "iter": e,
+        "best": best,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }, path)
+
+
+def maybe_resume(args, path, model, optimizer, scheduler, device, stage):
+    """Restore a state written by save_train_state. The scheduler is
+    rebuilt from the CURRENT args (so --iters may change between runs) and
+    fast-forwarded to the resumed iteration; sampling RNGs are not restored
+    (order shifts, distribution unchanged). Returns (start_iter, best)."""
+    if not args.resume:
+        return 0, None
+    if not os.path.isfile(path):
+        logging.warning("--resume: %s not found, starting fresh", path)
+        return 0, None
+    st = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(st["model_state_dict"])
+    optimizer.load_state_dict(st["optimizer_state_dict"])
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+    start = int(st["iter"]) + 1
+    if scheduler is not None:
+        for _ in range(start):
+            scheduler.step()
+    best = st.get("best")
+    logging.info("resumed stage %d from %s at iter %d (best %s)",
+                 stage, path, start, best)
+    return start, best
+
+
 class MetricsLogger:
     """Per-stage JSONL metrics log at <out_dir>/metrics_stage<N>.jsonl.
 
     The file is created (overwritten) at the start of every run and flushed
-    per record so training curves can be followed live. NaN/Inf floats are
-    written as null to keep every line strict JSON."""
+    per record so training curves can be followed live. With ``append=True``
+    (--resume) new records are appended to the previous run's file instead.
+    NaN/Inf floats are written as null to keep every line strict JSON."""
 
-    def __init__(self, out_dir, stage):
+    def __init__(self, out_dir, stage, append=False):
         self.path = os.path.join(out_dir, "metrics_stage{}.jsonl".format(stage))
-        self.handle = open(self.path, "w")
+        self.handle = open(self.path, "a" if append else "w")
 
     @staticmethod
     def _clean(value):
@@ -422,12 +461,20 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
     """Branch + trunk field training: L = lambda_pod * L_POD + lambda_field *
     L_field (per-variable pointwise MSE summed over variables, the
     ChannelwiseMSE convention of mPOD-DeepONet)."""
-    if args.init_from:
-        load_branch_from_checkpoint(branch, args.init_from)
-        logging.info("initialized branch from {}".format(args.init_from))
     trunk = TrunkNet(in_dim=8, rank=branch_kwargs["rank"], n_outputs=4,
                      hidden_sizes=tuple(args.trunk_hidden))
     model = PODDeepONet(branch, trunk).to(device)
+    if args.init_from:
+        state = torch.load(args.init_from, map_location="cpu",
+                           weights_only=True)
+        if state.get("model_type") == "pipod_deeponet_stage2":
+            model.load_state_dict(state["model_state_dict"])
+            logging.info("warm-started full operator from stage-2 "
+                         "checkpoint %s", args.init_from)
+        else:
+            load_branch_from_checkpoint(branch, args.init_from)
+            logging.info("initialized branch from {}".format(
+                args.init_from))
     build_shape_geometry(decoder, shapes, grid_points, grid_shape,
                          near_band=(args.field_near_band
                                     if args.field_near_frac > 0 else None),
@@ -441,7 +488,12 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
     loss_num = 0.0
     best = None
     ckpt_path = os.path.join(out_dir, "stage2.pth")
-    metrics_log = MetricsLogger(out_dir, 2)
+    state_path = os.path.join(out_dir, "train_state_stage2.pth")
+    metrics_log = MetricsLogger(out_dir, 2, append=args.resume)
+    start_iter, resumed_best = maybe_resume(
+        args, state_path, model, optimizer, scheduler, device, 2)
+    if resumed_best is not None:
+        best = resumed_best
 
     def save(val_metrics=None):
         checkpoint = {
@@ -469,7 +521,7 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
             })
         torch.save(checkpoint, ckpt_path)
 
-    for e in range(int(args.iterations)):
+    for e in range(start_iter, int(args.iterations)):
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         idx = sample_field_idx(s, num_points, args.n_field, gen,
@@ -493,6 +545,7 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
                 metrics_log.log({"iter": e, "loss": loss_num,
                                  "lr": optimizer.param_groups[0]["lr"],
                                  **_val_record(metrics)})
+                save_train_state(state_path, model, optimizer, e, best)
                 logging.info(
                     "iter {} loss: {:.6e} (pod {:.6e} field {:.6e}) | val rel "
                     "L2: {:.6e} per-var {} proj: {:.6e} mean-field: "
@@ -661,7 +714,12 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
     loss_num = 0.0
     best = None
     ckpt_path = os.path.join(out_dir, "stage3.pth")
-    metrics_log = MetricsLogger(out_dir, 3)
+    state_path = os.path.join(out_dir, "train_state_stage3.pth")
+    metrics_log = MetricsLogger(out_dir, 3, append=args.resume)
+    start_iter, resumed_best = maybe_resume(
+        args, state_path, model, optimizer, scheduler, device, 3)
+    if resumed_best is not None:
+        best = resumed_best
 
     def save(val_metrics=None):
         checkpoint = {
@@ -692,7 +750,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
             })
         torch.save(checkpoint, ckpt_path)
 
-    for e in range(int(args.iterations)):
+    for e in range(start_iter, int(args.iterations)):
         progress = e / max(int(args.iterations), 1)
         lam = (args.lambda_phys if args.lambda_phys is not None
                else physics_weight_schedule(progress))
@@ -752,6 +810,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                                  "lr": optimizer.param_groups[0]["lr"],
                                  "lambda_phys": lam,
                                  **_val_record(metrics)})
+                save_train_state(state_path, model, optimizer, e, best)
                 logging.info(
                     "iter {} loss: {:.6e} lam: {:.3g} {} | val rel L2: "
                     "{:.6e} val cont: {:.6e} mom: {:.6e} wall: "
@@ -790,7 +849,12 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
     loss_num = 0.0
     best = None
     ckpt_path = os.path.join(out_dir, "stage1.pth")
-    metrics_log = MetricsLogger(out_dir, 1)
+    state_path = os.path.join(out_dir, "train_state_stage1.pth")
+    metrics_log = MetricsLogger(out_dir, 1, append=args.resume)
+    start_iter, resumed_best = maybe_resume(
+        args, state_path, branch, optimizer, scheduler, device, 1)
+    if resumed_best is not None:
+        best = resumed_best
 
     def save(val_metrics=None):
         checkpoint = {
@@ -817,7 +881,7 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
             })
         torch.save(checkpoint, ckpt_path)
 
-    for e in range(int(args.iterations)):
+    for e in range(start_iter, int(args.iterations)):
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         pred = branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0))
@@ -833,6 +897,7 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
                 metrics_log.log({"iter": e, "loss": loss_num,
                                  "lr": optimizer.param_groups[0]["lr"],
                                  **_val_record(metrics)})
+                save_train_state(state_path, branch, optimizer, e, best)
                 logging.info(
                     "iter {} mse: {:.6e} | val coef mse: {:.6e} rel L2: "
                     "{:.6e} proj bound: {:.6e} mean-field: {:.6e}".format(
@@ -921,7 +986,13 @@ if __name__ == "__main__":
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--init_from", default=None,
                         help="checkpoint to initialize branch (stage 2) or "
-                        "the full operator (stage 3) from")
+                        "the full operator (stage 3, or stage 2 warm start "
+                        "from a stage-2 checkpoint) from")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume the stage from PipodONet/"
+                        "train_state_stage<N>.pth (model + optimizer + iter);"
+                        " the LR schedule is rebuilt from the current "
+                        "--iters, so the total length may change")
     parser.add_argument("--iters", dest="iterations", type=int, default=20000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr_schedule", choices=["constant", "cosine"],
