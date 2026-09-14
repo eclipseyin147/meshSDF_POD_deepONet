@@ -514,6 +514,45 @@ points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], 1)  # (G,3)，即 fields
 | `--lr_schedule` | constant | ✦ `cosine` = 2% warmup + 余弦衰减到 `lr×lr_final_ratio`（0.01）。实测同数据下 stage-2 best 0.567→0.474（配合数据扩充），主要收益在末段低噪声精修；`constant` 下 best 全靠噪声低点、终值常回弹 |
 | `--iters` | 20000 | 余弦日程绑定总 iter 数；调整后用 `--resume` 续训即可（日程自动重建快进） |
 
+#### config JSON 文件说明（`pipod_config.json` 输入 vs `config_stage<N>.json` 输出）
+
+**输入：`pipod_config.json`（手写，入版本库）**——`--config` 读取的运行配方。结构：
+
+```json
+{
+  "experiment": "examples/ellipsoids_of4",       // 实验目录（= -e）
+  "data": "data/ellipsoids",                     // SDF 数据根（= -d）
+  "split": "examples/ellipsoids/split.json",     // split（= -s）
+  "snapshots": "data/openfoam/ellipsoids_u10/snapshots",
+  "latent_manifest": ".../lhs_latents.npz",
+  "grid_stretch": true,                          // 顶层键 = 任意 CLI flag 的默认值
+  "iters": 40000,
+  "lr_schedule": "cosine",
+  "field_near_frac": 0.3,
+  "seed": 0,
+  "stages": [                                    // 逐阶段覆盖，按 --stage N 选取合并
+    {"stage": 1, "lr": 1e-3},
+    {"stage": 2, "lr": 1e-3},
+    {"stage": 3, "lr": 1e-4, "wall_bc": "noslip", "re": 100}
+  ]
+}
+```
+
+规则：
+
+1. **顶层键**可以是任何 CLI flag 名（dest 或带横线名均可；`experiment`/`data`/`split`/`iters` 是 `-e/-d/-s/--iters` 的别名）——值作为该 flag 的默认值；
+2. **`stages` 列表**：每个条目含 `stage` 编号，运行 `--stage N` 时该条目的键值合并进顶层——**优先级：CLI 显式传入 > stages 条目 > 顶层 > argparse 默认**。所以 stage-3 的 `lr: 1e-4` 只影响 stage 3，不用抄整份配置；
+3. **stage 链式**：`--stage 2/3` 且未给 `init_from` 时自动取 `PipodONet/stage<N-1>.pth`（stage 2 也可用 stage-2 checkpoint warm start，见参数表）；
+4. **未知键直接报错**（防拼写静默失效）；`--resume` 与 config 可叠加。
+
+**输出：`PipodONet/config_stage<N>.json`（自动生成，勿手改）**——每次运行把**解析后的完整参数**（含 config 合并、链式 init_from、所有 argparse 默认）原样存档。作用：
+
+- **复现凭证**：看到任何 `stage<N>.pth` 都能精确回答「它是在什么配置下训出来的」，包括当时没显式传的默认值；
+- **排障对照**：两轮结果不同时，diff 两份 config_stage 即可定位变量（之前「合成 stage-1 被误覆盖」事件就是因为缺这个凭证，此后所有运行强制存档）；
+- 键名是 argparse dest 形式（`experiment_directory`、`data_source`、`val_fraction`…），与上表 flag 一一对应；另有几个输出侧字段：`config`（输入 JSON 路径）、`checkpoint`（decoder 权重名，默认 latest）、`debug`/`logfile`（`deep_sdf.add_common_args` 的通用项）。
+
+**字段含义总表**：config 里的每个键与 CLI flag 同名同义，逐一对应上面「PIPOD 训练参数说明」四张表（数据与网格 / stage 1 / stage 2 / stage 3 / 优化器日程）。改配置前先查表中标 ✦ 的参数——它们是实测对结果有一阶影响的项。
+
 #### OpenFOAM 快照批量生成（§6.7 数据线）
 
 ```bash
