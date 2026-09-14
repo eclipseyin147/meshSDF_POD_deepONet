@@ -475,6 +475,7 @@ points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], 1)  # (G,3)，即 fields
 | `--pod_rank` | None | 固定公共秩（覆盖能量截断）。数据/内存受限时的手动阀 |
 | `--cases_per_shape --u_range --dir_cone_deg --wake_amp/--wake_sigma` | 4 / [10,20] / 180 / 0.15 / 0.5 | 仅 `--synthetic`：每形状案例数、来流速度范围、方向锥角、尾迹幅度/宽度 |
 | `--val_fraction` | 0.2 | 留出案例比例。val 集决定 best-on-val；太小评估噪声大，太大浪费训练数据 |
+| `--reconstruct_iterations` | 800 | **仅非 manifest 路径生效**：split 中无存储 latent 的形状，用其 SDF 采样点经 `reconstruct()` 现场反解 z 的隐式域拟合迭代数（lr 5e-3、8000 样本、L2 正则，DeepSDF 重建惯例）。过小 → z 欠拟合、几何表征失真，污染整条 (z→系数) 链路；过大 → 每形状白白多花几十秒。**`--latent_manifest` 时完全绕过**（z 直接取自 manifest，这也是 LHS 数据线用 manifest 的原因之一） |
 | `--seed` | 0 | 播种全部随机源（案例采样/val 划分/POD/训练循环），同配置逐位可复现 |
 
 **Stage 1（branch 系数回归，L = L_POD）**
