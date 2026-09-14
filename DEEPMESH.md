@@ -457,7 +457,62 @@ points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], 1)  # (G,3)，即 fields
 # stage 3 同上 + --init_from .../stage2.pth --lr 1e-4 --wall_bc noslip --re 150
 ```
 
-输出：`<experiment>/PipodONet/`：`pod_basis_{u,v,w,p}.pth`（cPOD 逐变量基 + 均值场 + 奇异值，仅 train 案例拟合）、`stage1/2/3.pth`（best-on-val；含 model_kwargs / rank / re / val 指标 / seed）、`metrics_stage<1|2|3>.jsonl`（每 50 iter 一条评估记录，含 val 系数 MSE、全场相对 L2（逐变量）、projection 下界、均值基线，stage 3 另有 val continuity/momentum/wall 残差与 λ_phys）。`--latent_manifest` 与 `--synthetic` 互斥。训练曲线可视化：`plot_pipod_metrics.py -e <experiment>`（出 `metrics.png`；`--overlay <exp2>` 叠加对比、`-w 30` 训练中每 30 s 实时刷新）。
+输出：`<experiment>/PipodONet/`：`pod_basis_{u,v,w,p}.pth`（cPOD 逐变量基 + 均值场 + 奇异值，仅 train 案例拟合）、`stage1/2/3.pth`（best-on-val；含 model_kwargs / rank / re / val 指标 / seed）、`metrics_stage<1|2|3>.jsonl`（每 50 iter 一条评估记录，含 val 系数 MSE、全场相对 L2（逐变量）、projection 下界、均值基线，stage 3 另有 val continuity/momentum/wall 残差与 λ_phys）、`train_state_stage<N>.pth`（每 50 iter 保存的完整训练状态：模型 + optimizer + iter + best，`--resume` 无损续训）。`--latent_manifest` 与 `--synthetic` 互斥。训练曲线可视化：`plot_pipod_metrics.py -e <experiment>`（出 `metrics.png`；`--overlay <exp2>` 叠加对比、`-w 30` 训练中每 30 s 实时刷新）。
+
+#### PIPOD 训练参数说明（按阶段分组）
+
+以下参数均可写在 `--config` JSON 顶层（`stages` 列表可放逐阶段覆盖），CLI 同名 flag 优先。标注 ✦ 的是实测对本项目结果有显著影响的参数。
+
+**数据与网格（三阶段共用，阶段间必须一致）**
+
+| 参数 | 默认 | 含义与影响 |
+|---|---|---|
+| `--snapshots` / `--synthetic` | 二选一 | 真实 npz 快照目录 / 现场生成合成势流场。合成场仅供流程验证（泛化差，见 §6.7） |
+| `--latent_manifest` | 无 | LHS 形状的 z 来源（npz: names+latents），跳过 split 的 latent 重建 |
+| `--grid_resolution` | 64 | 均匀参考网格 N³。与快照 G=N³ 强绑定，不一致直接报错 |
+| `--grid_stretch` | off | ✦ 双分辨率拉伸网格（107³，近壁 h=0.027/远场 0.064），配 `--grid_dense_half 1.35 --grid_h_fine --grid_growth`。边界层 δ 内采样点 2.1→3.7；点数 ×4.7，训练/评估同步变慢；与均匀网格快照不可混用 |
+| `--pod_energy` | 0.999 | POD 能量截断阈值。越大 rank 越大、投影下界越低但回归越难（实测 586 案例 r=351 时 stage-3 OOM 风险高） |
+| `--pod_rank` | None | 固定公共秩（覆盖能量截断）。数据/内存受限时的手动阀 |
+| `--cases_per_shape --u_range --dir_cone_deg --wake_amp/--wake_sigma` | 4 / [10,20] / 180 / 0.15 / 0.5 | 仅 `--synthetic`：每形状案例数、来流速度范围、方向锥角、尾迹幅度/宽度 |
+| `--val_fraction` | 0.2 | 留出案例比例。val 集决定 best-on-val；太小评估噪声大，太大浪费训练数据 |
+| `--seed` | 0 | 播种全部随机源（案例采样/val 划分/POD/训练循环），同配置逐位可复现 |
+
+**Stage 1（branch 系数回归，L = L_POD）**
+
+| 参数 | 默认 | 含义与影响 |
+|---|---|---|
+| `--hidden --num_layers --bc_hidden` | 256 / 4 / 64 | branch MLP 宽度/深度、bc 编码器宽度。stage-1 是结构上限（系数与空间无关），加大容量对 val 收益很小 |
+| `--iters --lr` | 20000 / 1e-3 | stage-1 通常 2–4k iter 即达 best，余弦日程下长 iters 无害（后期 lr≈0） |
+
+**Stage 2（branch+trunk 全场训练，L = L_POD + λ_f·L_field）**
+
+| 参数 | 默认 | 含义与影响 |
+|---|---|---|
+| `--trunk_hidden` | [256, 512] | trunk MLP 结构（in_dim=8 → rank×4）。场拟合能力的主要来源 |
+| `--lambda_pod --lambda_field` | 1.0 / 1.0 | 两项权重。λ_field 过小退化为 stage-1；过大则系数监督弱化 |
+| `--n_field` | 16384 | 每 iter 场监督点数。G=1.2M 时占比 ~1.3%，噪声大但覆盖快 |
+| `--field_near_frac --field_near_band` | 0 / 0.15 | ✦ 近壁重要性采样比例与 |sdf| 带宽。误差集中在边界层/尾迹，0.3–0.5 实测明显改善近壁拟合；拉伸网格下 0.3 即可（网格本身已聚近壁） |
+| `--init_from` | None | stage-1 checkpoint（branch 初始化）；**也接受 stage-2 checkpoint 做 warm start**（保权重、重置 optimizer 动量，用于中断后续跑） |
+| `--resume` | off | ✦ 从 `train_state_stage2.pth` 无损续训（含 optimizer 状态）；LR 日程按当前 `--iters` 重建并快进——调整总 iters 不浪费已跑进度 |
+
+**Stage 3（物理微调，L += λ_phys(t)·(L_cont+L_mom+L_wall+L_ff)）**
+
+| 参数 | 默认 | 含义与影响 |
+|---|---|---|
+| `--lr` | 1e-4（配置中） | 比 stage 2 低 10×，精修而非重学 |
+| `--lambda_phys` | None（日程） | ✦ 固定物理权重；不设时按日程 0→0.01→0.05→0.1（20%/50%/80% iter 处升档）。过早给大 λ 会让场误差上升，日程式最稳 |
+| `--re` | 1e4 | 动量方程特征雷诺数（ν=1/Re 进残差）。**必须与 CFD 工况一致**（U=10 ν=0.1 → Re=100），否则物理约束与数据打架 |
+| `--n_collocation` | 4096 | 每 iter 物理点数的（近壁 30%/尾迹 30%/高梯度 20%/均匀 20% 分层采样） |
+| `--phys_chunk` | 1024 | 二阶 autodiff 分块大小。**不改变结果**（梯度按计数归一，实测相对差 1.2e-7），只控显存：每 chunk 二阶图 ~3MB/点，256 是 8GB 卡的安全值 |
+| `--margin` | 2.0 | 流体掩码边距（sdf > margin·h 才算流体点），固体内部不算物理残差 |
+| `--wall_bc` | slip | 壁面约束类型：slip（u·n=0，无粘/势流）/ **noslip**（u=0，粘性数据必选，否则与 CFD 数据矛盾） |
+
+**优化器日程（各阶段通用）**
+
+| 参数 | 默认 | 含义与影响 |
+|---|---|---|
+| `--lr_schedule` | constant | ✦ `cosine` = 2% warmup + 余弦衰减到 `lr×lr_final_ratio`（0.01）。实测同数据下 stage-2 best 0.567→0.474（配合数据扩充），主要收益在末段低噪声精修；`constant` 下 best 全靠噪声低点、终值常回弹 |
+| `--iters` | 20000 | 余弦日程绑定总 iter 数；调整后用 `--resume` 续训即可（日程自动重建快进） |
 
 #### OpenFOAM 快照批量生成（§6.7 数据线）
 
