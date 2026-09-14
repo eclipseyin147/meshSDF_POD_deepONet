@@ -225,14 +225,26 @@ def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
 def fit_pod_bases(train_cases, energy, rank, device):
     """Per-variable cPOD on the training snapshots. Returns (bases, r) with
     r the common rank (max of energy-truncated per-variable ranks unless
-    ``rank`` fixes it)."""
+    ``rank`` fixes it). Small case counts use the exact Gram path - the
+    randomized range finder materializes several (D, l) GPU matrices, which
+    OOMs on large-D (stretched) grids for no accuracy gain at n <= 1024."""
     S = torch.stack([c["fields"] for _, c in train_cases])  # (N, G, 4)
-    bases = [pod_fit(S[:, :, v], energy=energy, rank=None, device=device)
-             for v in range(4)]
+    randomized = len(train_cases) > 1024
+    bases = []
+    for v in range(4):
+        b = pod_fit(S[:, :, v], energy=energy, rank=None,
+                    randomized=randomized, device=device)
+        bases.append(b.cpu())
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     r = max(b.rank for b in bases) if rank is None else rank
-    bases = [pod_fit(S[:, :, v], energy=energy, rank=r, device=device)
-             for v in range(4)]
-    bases = [b.cpu() for b in bases]  # (D, r) x4 stays off the GPU
+    bases = []
+    for v in range(4):
+        b = pod_fit(S[:, :, v], energy=energy, rank=r,
+                    randomized=randomized, device=device)
+        bases.append(b.cpu())
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     return bases, r
 
 
