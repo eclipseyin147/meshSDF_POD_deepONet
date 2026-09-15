@@ -7,6 +7,12 @@ docs/superpowers/specs/2026-09-11-pipod-deeponet-design.md).
 --stage 3: physics-informed fine-tuning from a stage-2 checkpoint
            (+ lambda_phys(progress) * (L_c + L_m + L_wall + L_ff)).
 
+Data residency: snapshot fields, per-shape SDF + SDF gradients and the POD
+bases all live on the GPU end-to-end, so per-iteration CPU->GPU copies are
+avoided. With --amp (default) model forwards run under torch.autocast fp16;
+stage-3 physics residuals stay in fp32 (second-order autodiff accuracy), and
+no GradScaler is used (Adam on O(1)-scale MSE losses).
+
 Snapshots follow the npz contract of deep_sdf.cfd.volume (fields (G, 4)
 [u, v, w, Cp] on the shared reference grid, bc (4,) = [U, dir], shape) and
 are nondimensionalized at load (u /= U). POD is fit per variable (cPOD) on
@@ -238,7 +244,7 @@ def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
                         "snapshot {} belongs to shape {}, expected {}".format(
                             path, snap["shape"], npz))
                 cases.append({"bc": snap["bc"].to(device),
-                              "fields": snap["fields"],  # CPU: moved per-use
+                              "fields": snap["fields"],  # GPU-resident
                               "case_id": os.path.basename(path)})
         else:
             paths = snap_index.get(npz)
@@ -249,11 +255,11 @@ def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
             for path in paths:
                 snap = load_snapshot(path, num_points)
                 cases.append({"bc": snap["bc"].to(device),
-                              "fields": snap["fields"],  # CPU: moved per-use
+                              "fields": snap["fields"],  # GPU-resident
                               "case_id": os.path.basename(path)})
         for c in cases:
-            c["fields"] = c["fields"].clone()
-            c["fields"][:, :3] /= c["bc"][0].cpu()  # nondim. velocity
+            c["fields"] = c["fields"].clone().to(device)  # GPU-resident
+            c["fields"][:, :3] /= c["bc"][0]  # nondim. velocity
         shapes.append({"name": npz, "latent": latent.detach(),
                        "cases": cases})
     if not shapes:
@@ -264,16 +270,18 @@ def build_shapes(args, decoder, latent_size, saved_model_epoch, npz_filenames,
 def fit_pod_bases(train_cases, energy, rank, device):
     """Per-variable cPOD on the training snapshots. Returns (bases, r) with
     r the common rank (max of energy-truncated per-variable ranks unless
-    ``rank`` fixes it). Small case counts use the exact Gram path - the
-    randomized range finder materializes several (D, l) GPU matrices, which
-    OOMs on large-D (stretched) grids for no accuracy gain at n <= 1024."""
+    ``rank`` fixes it). Bases stay on ``device`` (GPU-resident fields make
+    on-device projection/evaluation free). Small case counts use the exact
+    Gram path - the randomized range finder materializes several (D, l) GPU
+    matrices, which OOMs on large-D (stretched) grids for no accuracy gain
+    at n <= 1024."""
     S = torch.stack([c["fields"] for _, c in train_cases])  # (N, G, 4)
     randomized = len(train_cases) > 1024
     bases = []
     for v in range(4):
         b = pod_fit(S[:, :, v], energy=energy, rank=None,
                     randomized=randomized, device=device)
-        bases.append(b.cpu())
+        bases.append(b)
         if device.type == "cuda":
             torch.cuda.empty_cache()
     r = max(b.rank for b in bases) if rank is None else rank
@@ -281,7 +289,7 @@ def fit_pod_bases(train_cases, energy, rank, device):
     for v in range(4):
         b = pod_fit(S[:, :, v], energy=energy, rank=r,
                     randomized=randomized, device=device)
-        bases.append(b.cpu())
+        bases.append(b)
         if device.type == "cuda":
             torch.cuda.empty_cache()
     return bases, r
@@ -305,21 +313,25 @@ def set_normalizations(branch, train_shapes, train_cases, val_cases):
     branch.set_coef_normalization(train_coefs.mean(0), train_coefs.std(0))
     # 标准化目标对 train 与 val 案例都要设置（val 评估需要 target）
     for _, c in train_cases + val_cases:
-        c["target"] = ((c["coef"] - branch.coef_mean.cpu())
-                       / branch.coef_std.cpu()).detach()
+        c["target"] = ((c["coef"] - branch.coef_mean)
+                       / branch.coef_std).detach()  # GPU-resident
 
 
-def evaluate_stage1(branch, bases, flat_cases):
+def evaluate_stage1(branch, bases, flat_cases, amp=False):
     """Mean over cases: standardized coef MSE, per-variable reconstructed
-    relative L2 (mean), projection lower bound, mean-field baseline."""
+    relative L2 (mean), projection lower bound, mean-field baseline.
+    ``amp``: fp16 autocast for the branch forwards (matches training)."""
     loss_fn = torch.nn.MSELoss()
     coef_mses, rel_l2s, projs, baselines = [], [], [], []
     with torch.no_grad():
         for s, c in flat_cases:
-            pred_n = branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0))
+            with torch.autocast(device_type="cuda", dtype=torch.float16,
+                                enabled=amp):
+                pred_n = branch.forward_normalized(
+                    s["latent"], c["bc"].unsqueeze(0))
+                a_pred = branch(s["latent"], c["bc"].unsqueeze(0))
             coef_mses.append(loss_fn(
                 pred_n, c["target"].unsqueeze(0).to(pred_n.device)).item())
-            a_pred = branch(s["latent"], c["bc"].unsqueeze(0)).cpu()
             errs, ps, bs = [], [], []
             for v in range(4):
                 Y = c["fields"][:, v].unsqueeze(0)
@@ -354,9 +366,9 @@ def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
                     sds.append(deep_sdf.utils.decode_sdf(
                         decoder, s["latent"], chunk).squeeze(1).float())
                     head += max_batch
-            s["sdf"] = torch.cat(sds, 0).cpu()  # CPU: slices moved per-use
+            s["sdf"] = torch.cat(sds, 0)  # GPU-resident
             s["sdf_grad"] = compute_sdf_gradients(
-                decoder, s["latent"], grid_points, max_batch).cpu()
+                decoder, s["latent"], grid_points, max_batch)
             s["h"] = spacing
             if h_grid is not None:
                 s["h_grid"] = h_grid  # shared (G,) CPU tensor
@@ -372,8 +384,8 @@ def build_shape_geometry(decoder, shapes, grid_points, grid_shape,
 
 def make_features(grid_points, shape, idx):
     """(n, 8) trunk features [x, y, z, sdf, dsdf/dx, dsdf/dy, dsdf/dz, h].
-    sdf/grad (and h on stretched grids) live on the CPU; only the indexed
-    slice is moved."""
+    ``idx`` must be on the grid's device; sdf/sdf_grad are GPU-resident, only
+    the shared CPU h_grid (stretched grids) needs an indexed copy."""
     n = idx.numel()
     idx_c = idx.cpu()
     device = grid_points.device
@@ -383,8 +395,8 @@ def make_features(grid_points, shape, idx):
         h = torch.full((n, 1), shape["h"], device=device)
     return torch.cat([
         grid_points[idx],
-        shape["sdf"][idx_c].unsqueeze(1).to(device),
-        shape["sdf_grad"][idx_c].to(device),
+        shape["sdf"][idx].unsqueeze(1),
+        shape["sdf_grad"][idx],
         h,
     ], dim=1)
 
@@ -403,33 +415,40 @@ def sample_field_idx(shape, num_points, n, gen, near_frac=0.0):
     parts.append(shape["near_idx"][sel])
     return torch.cat(parts)
 
-def predict_field(model, shape, bc, grid_points, chunk=2 ** 16):
-    """Full-grid field prediction (no_grad, chunked) -> (G, 4)."""
+def predict_field(model, shape, bc, grid_points, chunk=2 ** 16, amp=False):
+    """Full-grid field prediction (no_grad, chunked) -> (G, 4) on the
+    grid's device."""
     outs = []
     with torch.no_grad():
         for i in range(0, grid_points.shape[0], chunk):
             idx = torch.arange(i, min(i + chunk, grid_points.shape[0]),
                                device=grid_points.device)
-            outs.append(model(shape["latent"], bc.unsqueeze(0),
-                              make_features(grid_points, shape, idx)))
+            with torch.autocast(device_type="cuda", dtype=torch.float16,
+                                enabled=amp):
+                outs.append(model(shape["latent"], bc.unsqueeze(0),
+                                  make_features(grid_points, shape, idx)))
     return torch.cat(outs, 0)
 
 
-def evaluate_field(model, bases, flat_cases, grid_points):
+def evaluate_field(model, bases, flat_cases, grid_points, amp=False):
     """Per-variable and mean relative L2 of the full-grid prediction, plus
     the projection lower bound and the mean-field baseline (both from the
-    POD bases) and the standardized coefficient MSE."""
+    POD bases) and the standardized coefficient MSE. All field math stays
+    on the grid's device; only the tiny per-variable means are uploaded."""
     loss_fn = torch.nn.MSELoss()
     rel_l2_v, projs, baselines, coef_mses = [], [], [], []
     for s, c in flat_cases:
-        pred = predict_field(model, s, c["bc"], grid_points).cpu()
+        pred = predict_field(model, s, c["bc"], grid_points, amp=amp)
         truth = c["fields"]
         per_var = ((pred - truth).pow(2).sum(0)
                    / truth.pow(2).sum(0).clamp_min(1e-30)).sqrt()
         rel_l2_v.append(per_var.cpu())
+        with torch.autocast(device_type="cuda", dtype=torch.float16,
+                            enabled=amp):
+            pred_n = model.branch.forward_normalized(
+                s["latent"], c["bc"].unsqueeze(0))
         coef_mses.append(loss_fn(
-            model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
-            c["target"].unsqueeze(0).to(grid_points.device)).item())
+            pred_n, c["target"].unsqueeze(0).to(grid_points.device)).item())
         ps, bs = [], []
         for v in range(4):
             Y = truth[:, v].unsqueeze(0)
@@ -525,14 +544,17 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         idx = sample_field_idx(s, num_points, args.n_field, gen,
-                               args.field_near_frac)
-        q = model(s["latent"], c["bc"].unsqueeze(0),
-                  make_features(grid_points, s, idx.to(device)))
-        loss_field = ((q - c["fields"][idx].to(device)) ** 2
-                      ).mean(dim=0).sum()
-        loss_pod = loss_fn(
-            model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
-            c["target"].unsqueeze(0).to(device))
+                               args.field_near_frac).to(device)
+        with torch.autocast(device_type="cuda", dtype=torch.float16,
+                            enabled=args.amp):
+            q = model(s["latent"], c["bc"].unsqueeze(0),
+                      make_features(grid_points, s, idx))
+            loss_field = ((q.float() - c["fields"][idx]) ** 2
+                          ).mean(dim=0).sum()
+            loss_pod = loss_fn(
+                model.branch.forward_normalized(
+                    s["latent"], c["bc"].unsqueeze(0)).float(),
+                c["target"].unsqueeze(0).to(device))
         loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
         loss.backward()
         optimizer.step()
@@ -541,7 +563,8 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
         loss_num = loss.item()
         if e % 50 == 0:
             if val_cases:
-                metrics = evaluate_field(model, bases, val_cases, grid_points)
+                metrics = evaluate_field(model, bases, val_cases, grid_points,
+                                         amp=args.amp)
                 metrics_log.log({"iter": e, "loss": loss_num,
                                  "lr": optimizer.param_groups[0]["lr"],
                                  **_val_record(metrics)})
@@ -560,7 +583,8 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
             else:
                 logging.info("iter {} loss: {:.6e}".format(e, loss_num))
     if val_cases and best is None:
-        metrics = evaluate_field(model, bases, val_cases, grid_points)
+        metrics = evaluate_field(model, bases, val_cases, grid_points,
+                                 amp=args.amp)
         best = metrics["rel_l2"]
         save(metrics)
     elif not val_cases:
@@ -622,7 +646,7 @@ def boundary_losses(model, shape, bc, grid_points, idx_wall, idx_far,
         q_w = model(shape["latent"], bc.unsqueeze(0),
                     make_features(grid_points, shape, idx_wall))
         if wall_bc == "slip":
-            n_w = shape["sdf_grad"][idx_wall.cpu()].to(grid_points.device)
+            n_w = shape["sdf_grad"][idx_wall]
             n_w = n_w / n_w.norm(dim=1, keepdim=True).clamp_min(1e-12)
             l_wall = wall_slip_loss(q_w, n_w)
         else:
@@ -645,10 +669,10 @@ def load_operator_from_checkpoint(model, path):
 
 
 def evaluate_physics(model, informer, decoder, bases, val_cases, grid_points,
-                     grid_shape, sampler, args, device):
+                     grid_shape, sampler, args, device, amp=False):
     """evaluate_field + physics residuals on a fixed-seed val collocation
     set + wall violation."""
-    metrics = evaluate_field(model, bases, val_cases, grid_points)
+    metrics = evaluate_field(model, bases, val_cases, grid_points, amp=amp)
     conts, moms, walls = [], [], []
     gen = torch.Generator().manual_seed(args.seed + 12345)  # 固定评估集
     for s, c in val_cases:
@@ -672,9 +696,11 @@ def evaluate_physics(model, informer, decoder, bases, val_cases, grid_points,
         moms.append(lm.sqrt().item())
         if picks["wall"].numel():
             with torch.no_grad():
-                q_w = model(s["latent"], c["bc"].unsqueeze(0),
-                            make_features(grid_points, s, picks["wall"]))
-                n_w = s["sdf_grad"][picks["wall"].cpu()].to(device)
+                with torch.autocast(device_type="cuda", dtype=torch.float16,
+                                    enabled=amp):
+                    q_w = model(s["latent"], c["bc"].unsqueeze(0),
+                                make_features(grid_points, s, picks["wall"]))
+                n_w = s["sdf_grad"][picks["wall"]]
                 n_w = n_w / n_w.norm(dim=1, keepdim=True).clamp_min(1e-12)
                 walls.append(
                     ((q_w[:, :3] * n_w).sum(1).abs()
@@ -757,14 +783,17 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
         idx = sample_field_idx(s, num_points, args.n_field, gen,
-                               args.field_near_frac)
-        q = model(s["latent"], c["bc"].unsqueeze(0),
-                  make_features(grid_points, s, idx.to(device)))
-        loss_field = ((q - c["fields"][idx].to(device)) ** 2
-                      ).mean(dim=0).sum()
-        loss_pod = loss_fn(
-            model.branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0)),
-            c["target"].unsqueeze(0).to(device))
+                               args.field_near_frac).to(device)
+        with torch.autocast(device_type="cuda", dtype=torch.float16,
+                            enabled=args.amp):
+            q = model(s["latent"], c["bc"].unsqueeze(0),
+                      make_features(grid_points, s, idx))
+            loss_field = ((q.float() - c["fields"][idx]) ** 2
+                          ).mean(dim=0).sum()
+            loss_pod = loss_fn(
+                model.branch.forward_normalized(
+                    s["latent"], c["bc"].unsqueeze(0)).float(),
+                c["target"].unsqueeze(0).to(device))
         loss = args.lambda_pod * loss_pod + args.lambda_field * loss_field
         phys_terms = {}
         if lam > 0.0:
@@ -780,17 +809,20 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                 picks = None
             if picks is not None:
                 # physics residuals backward per chunk (scaled by lam) so at
-                # most one second-order graph is alive at a time
-                lc, lm = physics_losses(
-                    model, informer, decoder, s["latent"],
-                    c["bc"].unsqueeze(0),
-                    grid_points[picks["collocation"]],
-                    (s["h_grid"][picks["collocation"].cpu()].unsqueeze(1)
-                     if "h_grid" in s else s["h"]),
-                    args.phys_chunk, backward_scale=lam)
-                lw, lf = boundary_losses(model, s, c["bc"], grid_points,
-                                         picks["wall"], picks["far"],
-                                         args.wall_bc)
+                # most one second-order graph is alive at a time. AMP is
+                # disabled here: second-order autodiff through the decoder
+                # and the residual magnitudes stay fp32 for accuracy.
+                with torch.autocast(device_type="cuda", enabled=False):
+                    lc, lm = physics_losses(
+                        model, informer, decoder, s["latent"],
+                        c["bc"].unsqueeze(0),
+                        grid_points[picks["collocation"]],
+                        (s["h_grid"][picks["collocation"].cpu()].unsqueeze(1)
+                         if "h_grid" in s else s["h"]),
+                        args.phys_chunk, backward_scale=lam)
+                    lw, lf = boundary_losses(model, s, c["bc"], grid_points,
+                                             picks["wall"], picks["far"],
+                                             args.wall_bc)
                 loss = loss + lam * (lw + lf)
                 phys_terms = {"cont": lc.item(), "mom": lm.item(),
                               "wall": lw.item(), "far": lf.item()}
@@ -805,7 +837,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
             if val_cases:
                 metrics = evaluate_physics(model, informer, decoder, bases,
                                            val_cases, grid_points,
-                                           grid_shape, sampler, args, device)
+                                           grid_shape, sampler, args, device,
+                                           amp=args.amp)
                 metrics_log.log({"iter": e, "loss": loss_num,
                                  "lr": optimizer.param_groups[0]["lr"],
                                  "lambda_phys": lam,
@@ -828,7 +861,7 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
     if val_cases and best is None:
         metrics = evaluate_physics(model, informer, decoder, bases, val_cases,
                                    grid_points, grid_shape, sampler, args,
-                                   device)
+                                   device, amp=args.amp)
         best = metrics["rel_l2"]
         save(metrics)
     elif not val_cases:
@@ -884,8 +917,13 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
     for e in range(start_iter, int(args.iterations)):
         optimizer.zero_grad()
         s, c = rng.choice(train_cases)
-        pred = branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0))
-        loss = loss_fn(pred, c["target"].unsqueeze(0).to(pred.device))
+        with torch.autocast(device_type="cuda", dtype=torch.float16,
+                            enabled=args.amp):
+            pred = branch.forward_normalized(s["latent"], c["bc"].unsqueeze(0))
+        # .float(): MSELoss against an fp32 target promotes the diff to fp32
+        # without a grad-safe cast node, so autocast fp16 grads must not
+        # originate inside the loss.
+        loss = loss_fn(pred.float(), c["target"].unsqueeze(0).to(pred.device))
         loss.backward()
         optimizer.step()
         if scheduler is not None:
@@ -893,7 +931,8 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
         loss_num = loss.item()
         if e % 50 == 0:
             if val_cases:
-                metrics = evaluate_stage1(branch, bases, val_cases)
+                metrics = evaluate_stage1(branch, bases, val_cases,
+                                          amp=args.amp)
                 metrics_log.log({"iter": e, "loss": loss_num,
                                  "lr": optimizer.param_groups[0]["lr"],
                                  **_val_record(metrics)})
@@ -909,7 +948,7 @@ def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
             else:
                 logging.info("iter {} mse: {:.6e}".format(e, loss_num))
     if val_cases and best is None:
-        metrics = evaluate_stage1(branch, bases, val_cases)
+        metrics = evaluate_stage1(branch, bases, val_cases, amp=args.amp)
         best = metrics["rel_l2"]
         save(metrics)
     elif not val_cases:
@@ -1028,6 +1067,11 @@ if __name__ == "__main__":
     parser.add_argument("--reconstruct_iters", dest="reconstruct_iterations",
                         type=int, default=800)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--amp", dest="amp", action="store_true", default=True,
+                        help="fp16 autocast for model forwards (default); "
+                        "stage-3 physics residuals always stay fp32")
+    parser.add_argument("--no_amp", dest="amp", action="store_false",
+                        help="disable AMP (pure fp32)")
     deep_sdf.add_common_args(parser)
 
     if cfg:
