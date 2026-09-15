@@ -973,8 +973,8 @@ if __name__ == "__main__":
                         "(dense near the body, coarse far-field) instead of "
                         "the uniform grid_resolution grid")
     parser.add_argument("--grid_domain_hi", type=float, default=1.5)
-    parser.add_argument("--grid_dense_half", type=float, default=1.35)
-    parser.add_argument("--grid_h_fine", type=float, default=0.027)
+    parser.add_argument("--grid_dense_half", type=float, default=1.1)
+    parser.add_argument("--grid_h_fine", type=float, default=0.022)
     parser.add_argument("--grid_growth", type=float, default=1.35)
     parser.add_argument("--pod_energy", type=float, default=0.999)
     parser.add_argument("--pod_rank", type=int, default=None)

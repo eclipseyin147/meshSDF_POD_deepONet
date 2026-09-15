@@ -15,21 +15,20 @@ def running_mean(x, N):
     return (cumsum[N:] - cumsum[:-N]) / float(N)
 
 
-def load_logs(experiment_directory, type):
+def load_logs(experiment_directory):
 
-    logs = torch.load(os.path.join(experiment_directory, ws.logs_filename))
+    return torch.load(os.path.join(experiment_directory, ws.logs_filename))
 
-    logging.info("latest epoch is {}".format(logs["epoch"]))
+
+def draw(logs, ax, type):
+
+    ax.clear()
 
     num_iters = len(logs["loss"])
     iters_per_epoch = num_iters / logs["epoch"]
 
-    logging.info("{} iters per epoch".format(iters_per_epoch))
-
     smoothed_loss_41 = running_mean(logs["loss"], 41)
     smoothed_loss_1601 = running_mean(logs["loss"], 1601)
-
-    fig, ax = plt.subplots()
 
     if type == "loss":
 
@@ -45,7 +44,11 @@ def load_logs(experiment_directory, type):
             "#16628b",
         )
 
-        ax.set(xlabel="Epoch", ylabel="Loss", title="Training Loss")
+        ax.set(
+            xlabel="Epoch",
+            ylabel="Loss",
+            title="Training Loss (latest epoch {})".format(logs["epoch"]),
+        )
 
     elif type == "learning_rate":
         combined_lrs = np.array(logs["learning_rate"])
@@ -56,6 +59,7 @@ def load_logs(experiment_directory, type):
             np.arange(combined_lrs.shape[0]),
             combined_lrs[:, 1],
         )
+
         ax.set(xlabel="Epoch", ylabel="Learning Rate", title="Learning Rates")
 
     elif type == "time":
@@ -76,6 +80,36 @@ def load_logs(experiment_directory, type):
         raise Exception('unrecognized plot type "{}"'.format(type))
 
     ax.grid()
+
+
+def watch_logs(experiment_directory, type, interval):
+    """Live-refreshing plot: reloads Logs.pth every `interval` seconds."""
+    from matplotlib.animation import FuncAnimation
+
+    fig, ax = plt.subplots()
+
+    def update(_frame):
+        try:
+            logs = load_logs(experiment_directory)
+        except (FileNotFoundError, EOFError, RuntimeError):
+            # Logs.pth 尚未生成或正在被训练进程写入，跳过这一帧
+            return
+        draw(logs, ax, type)
+
+    anim = FuncAnimation(fig, update, interval=interval * 1000, cache_frame_data=False)
+    plt.show()
+
+
+def plot_logs(experiment_directory, type):
+
+    logs = load_logs(experiment_directory)
+
+    logging.info("latest epoch is {}".format(logs["epoch"]))
+
+    fig, ax = plt.subplots()
+
+    draw(logs, ax, type)
+
     plt.show()
 
 
@@ -94,6 +128,15 @@ if __name__ == "__main__":
         + "as well",
     )
     arg_parser.add_argument("--type", "-t", dest="type", default="loss")
+    arg_parser.add_argument(
+        "--watch",
+        "-w",
+        dest="watch_interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="live mode: reload Logs.pth and redraw every SECONDS (e.g. -w 10)",
+    )
 
     deep_sdf.add_common_args(arg_parser)
 
@@ -101,4 +144,7 @@ if __name__ == "__main__":
 
     deep_sdf.configure_logging(args)
 
-    load_logs(args.experiment_directory, args.type)
+    if args.watch_interval is not None:
+        watch_logs(args.experiment_directory, args.type, args.watch_interval)
+    else:
+        plot_logs(args.experiment_directory, args.type)

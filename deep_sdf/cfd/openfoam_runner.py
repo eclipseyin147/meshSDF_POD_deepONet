@@ -37,7 +37,7 @@ One case per (shape, boundary condition):
   snapshot contract via ``deep_sdf.cfd.volume.save_snapshot``.
 
 Everything lives in the DeepSDF normalized coordinate system: bodies of
-semi-axis <= 0.9 centered at the origin, domain [-18, 18]^3 (>10x the longest
+semi-axis <= 0.9 centered at the origin, domain [-9, 9]^3 (>5x the longest
 full axis), U of O(10), kinematic viscosity nu = 0.1 (Re ~ 270, laminar).
 """
 
@@ -60,12 +60,12 @@ from deep_sdf.cfd.labels import export_stl
 from deep_sdf.cfd.volume import save_snapshot
 
 DEFAULT_NU = 0.1
-DEFAULT_DOMAIN_HALF = 18.0
+DEFAULT_DOMAIN_HALF = 9.0
 DEFAULT_N_BASE = 36
 DEFAULT_LAYERS = 6
 DEFAULT_LAYER_RATIO = 1.25
 DEFAULT_FIRST_LAYER = 0.011
-DEFAULT_SURFACE_LEVEL = 3
+DEFAULT_SURFACE_LEVEL = 4
 WAKE_LEVEL = 2
 WAKE_REACH = 6.0  # box extends from -1 to +6 along the free-stream direction
 WAKE_HALF_WIDTH = 1.5
@@ -76,6 +76,11 @@ PROBE_UNSET = -1.0e30  # probes sentinel for locations without a cell
 # has not sourced it - the bashrc's LD_LIBRARY_PATH conflicts with the venv
 # torch CUDA libraries, so the Python driver runs without it)
 OF_BASHRC = "/opt/openfoam14/etc/bashrc"
+
+# OpenFOAM 14 is built against the system OpenMPI (FOAM_MPI=openmpi-system);
+# a user-local mpiexec earlier on PATH (e.g. a CUDA build) breaks inside the
+# sourced OpenFOAM environment, so prefer the system launcher explicitly.
+MPIEXEC = "/usr/bin/mpiexec" if os.path.isfile("/usr/bin/mpiexec") else "mpiexec"
 
 
 def _foam_header(object_name, cls="dictionary", location="system"):
@@ -218,11 +223,12 @@ def decoder_sdf_mask(decoder, latent, grid_points, max_batch=2 ** 18):
 
 
 def write_stl_from_geometry(path, axes=None, decoder=None, latent=None,
-                            resolution=63):
+                            resolution=63, subdivisions=4):
     """Write the body surface as an ASCII STL.
 
     Analytic path (``axes=(a, b, c)``): a trimesh icosphere with
-    ``subdivisions=3`` scaled by the semi-axes (analytically exact for the
+    ``subdivisions`` subdivisions (default 4, 5120 faces) scaled by the
+    semi-axes (analytically exact for the
     ellipsoid family). Latent path (``decoder`` + ``latent``): the zero level
     set extracted with ``mesh_from_latent`` (dense ``resolution``^3 SDF grid,
     CPU skimage marching cubes - the GPU is reserved for training). Both
@@ -230,7 +236,7 @@ def write_stl_from_geometry(path, axes=None, decoder=None, latent=None,
     "deepsdf").
     """
     if axes is not None:
-        mesh = trimesh.creation.icosphere(subdivisions=3)
+        mesh = trimesh.creation.icosphere(subdivisions=subdivisions)
         verts = torch.from_numpy(
             np.asarray(mesh.vertices, dtype=np.float64) * np.asarray(axes)
         ).float()
@@ -304,7 +310,7 @@ def _snappy_hex_mesh_dict(surface_level, layers, layer_ratio, first_layer,
         }
     }
 
-    resolveFeatureAngle 60;
+    resolveFeatureAngle 30;
 
     refinementRegions
     {
@@ -328,8 +334,8 @@ snapControls
     nRelaxIter      5;
 
     nFeatureSnapIter 10;
-    implicitFeatureSnap false;
-    explicitFeatureSnap true;
+    implicitFeatureSnap true;
+    explicitFeatureSnap false;
     multiRegionFeatureSnap false;
 }
 
@@ -438,6 +444,7 @@ divSchemes
 {
     default         none;
     div(phi,U)      bounded Gauss linearUpwindV grad(U);
+    div(div(phi,U)) Gauss linear;
     div((nuEff*dev2(T(grad(U))))) Gauss linear;
 }
 
@@ -483,6 +490,14 @@ def _fv_solution(residual_p, residual_u):
         nSweeps         2;
         tolerance       1e-08;
         relTol          0.05;
+    }
+
+    Phi
+    {
+        solver          GAMG;
+        tolerance       1e-07;
+        relTol          0.01;
+        smoother        GaussSeidel;
     }
 }
 
@@ -603,7 +618,7 @@ def make_case(case_dir, stl_path, bc, nu=DEFAULT_NU,
               layers=DEFAULT_LAYERS, layer_ratio=DEFAULT_LAYER_RATIO,
               first_layer=DEFAULT_FIRST_LAYER,
               surface_level=DEFAULT_SURFACE_LEVEL, end_time=2000,
-              residual_p=1e-5, residual_u=1e-6):
+              residual_p=1e-4, residual_u=1e-6):
     """Write a complete OpenFOAM 14 laminar external-flow case.
 
     The STL is copied to ``constant/geometry/body.stl``; all outer boundary
@@ -641,7 +656,11 @@ def _run(cmd, case_dir, log_name):
     command is not on PATH (the OpenFOAM bashrc pollutes LD_LIBRARY_PATH for
     torch, so the Python driver normally runs un-sourced), it is executed in
     a subshell that sources ``OF_BASHRC`` first."""
-    if shutil.which(cmd[0]) is None:
+    probe = cmd[0]
+    if os.path.basename(probe).startswith("mpiexec"):
+        # parallel invocation: the OpenFOAM binary follows "-np <n>"
+        probe = cmd[cmd.index("-np") + 2]
+    if shutil.which(probe) is None:
         cmd = ["bash", "-c", "source {} >/dev/null 2>&1 && exec \"$@\"".format(OF_BASHRC),
                "of"] + cmd
     log_path = os.path.join(case_dir, log_name)
@@ -658,41 +677,41 @@ def _run(cmd, case_dir, log_name):
 
 
 def run_case(case_dir, n_procs=1):
-    """blockMesh -> checkMesh -> snappyHexMesh -> checkMesh -> simpleFoam
-    (the OpenFOAM 14 compatibility wrapper of
+    """blockMesh -> checkMesh -> snappyHexMesh -> checkMesh -> potentialFoam
+    (initialisation) -> simpleFoam (the OpenFOAM 14 compatibility wrapper of
     ``foamRun -solver incompressibleFluid``; controlDict carries
-    ``solver incompressibleFluid`` either way). With ``n_procs > 1`` the mesh
-    and solver run in parallel via decomposePar and are reconstructed at the
-    end. Commands fall back to a subshell sourcing ``OF_BASHRC`` when they
-    are not on PATH."""
+    ``solver incompressibleFluid`` either way). Meshing is serial; with
+    ``n_procs > 1`` the case is decomposed after snappyHexMesh and the two
+    solvers run in parallel, reconstructed at the end. Commands fall back to
+    a subshell sourcing ``OF_BASHRC`` when they are not on PATH."""
     if shutil.which("blockMesh") is None and not os.path.isfile(OF_BASHRC):
         raise RuntimeError(
             "OpenFOAM not on PATH and no bashrc at {} - install OpenFOAM 14 "
             "or source its bashrc first".format(OF_BASHRC)
         )
     parallel = int(n_procs) > 1
+    _run(["blockMesh"], case_dir, "log.blockMesh")
+    _run(["checkMesh"], case_dir, "log.checkMesh.blockMesh")
+    _run(["snappyHexMesh", "-overwrite"], case_dir, "log.snappyHexMesh")
+    _run(["checkMesh"], case_dir, "log.checkMesh")
     if parallel:
+        # decompose AFTER snappyHexMesh; plain decomposePar decomposes the
+        # 0/ fields and adds the processor-boundary patchField entries
+        # (-copyZero would only copy them verbatim and solvers would fail)
         _write(
             os.path.join(case_dir, "system", "decomposeParDict"),
             _foam_header("decomposeParDict")
             + "numberOfSubdomains %d;\n\nmethod          scotch;\n" % int(n_procs)
             + _foam_footer(),
         )
-        _run(["blockMesh"], case_dir, "log.blockMesh")
-        _run(["checkMesh"], case_dir, "log.checkMesh.blockMesh")
-        _run(["decomposePar", "-copyZero"], case_dir, "log.decomposePar")
-        _run(["mpiexec", "-np", str(int(n_procs)), "snappyHexMesh", "-parallel",
-              "-overwrite"], case_dir, "log.snappyHexMesh")
-        _run(["mpiexec", "-np", str(int(n_procs)), "checkMesh", "-parallel"],
-             case_dir, "log.checkMesh")
-        _run(["mpiexec", "-np", str(int(n_procs)), "simpleFoam", "-parallel"],
+        _run(["decomposePar", "-force"], case_dir, "log.decomposePar")
+        _run([MPIEXEC, "-np", str(int(n_procs)), "potentialFoam",
+              "-parallel", "-writep"], case_dir, "log.potentialFoam")
+        _run([MPIEXEC, "-np", str(int(n_procs)), "simpleFoam", "-parallel"],
              case_dir, "log.simpleFoam")
         _run(["reconstructPar", "-latestTime"], case_dir, "log.reconstructPar")
     else:
-        _run(["blockMesh"], case_dir, "log.blockMesh")
-        _run(["checkMesh"], case_dir, "log.checkMesh.blockMesh")
-        _run(["snappyHexMesh", "-overwrite"], case_dir, "log.snappyHexMesh")
-        _run(["checkMesh"], case_dir, "log.checkMesh")
+        _run(["potentialFoam", "-writep"], case_dir, "log.potentialFoam")
         _run(["simpleFoam"], case_dir, "log.simpleFoam")
     return case_dir
 

@@ -2,6 +2,7 @@
 # Copyright 2004-present Facebook. All Rights Reserved.
 
 import torch
+import torch.nn.functional as F
 import torch.utils.data as data_utils
 import signal
 import sys
@@ -321,8 +322,29 @@ def main_function(experiment_directory, continue_from, batch_split):
     maxT = clamp_dist
     enforce_minmax = True
 
+    field_type = get_spec_with_default(specs, "FieldType", "sdf")
+    if field_type == "occupancy":
+        enforce_minmax = False
+    elif field_type != "sdf":
+        raise Exception('unknown FieldType "{}"'.format(field_type))
+
     do_code_regularization = get_spec_with_default(specs, "CodeRegularization", True)
     code_reg_lambda = get_spec_with_default(specs, "CodeRegularizationLambda", 1e-4)
+
+    # Early stopping on epoch-mean loss: stop when the relative improvement
+    # between the previous window of W epochs and the most recent W epochs
+    # drops below EarlyStopRelativeTolerance. Disabled by default.
+    early_stop_tol = get_spec_with_default(specs, "EarlyStopRelativeTolerance", None)
+    early_stop_window = get_spec_with_default(specs, "EarlyStopWindow", 50)
+    early_stop_min_epoch = get_spec_with_default(
+        specs, "EarlyStopMinEpoch", 2 * early_stop_window
+    )
+    if early_stop_tol is not None:
+        logging.info(
+            "early stopping enabled: rel. tol={}, window={} epochs, min epoch={}".format(
+                early_stop_tol, early_stop_window, early_stop_min_epoch
+            )
+        )
 
     code_bound = get_spec_with_default(specs, "CodeBound", None)
 
@@ -449,6 +471,8 @@ def main_function(experiment_directory, continue_from, batch_split):
         )
     )
 
+    epoch_loss_log = []
+
     for epoch in range(start_epoch, num_epochs + 1):
 
         start = time.time()
@@ -458,6 +482,8 @@ def main_function(experiment_directory, continue_from, batch_split):
         decoder.train()
 
         adjust_learning_rate(lr_schedules, optimizer_all, epoch)
+
+        epoch_losses = []
 
         for sdf_data, indices in sdf_loader:
 
@@ -495,10 +521,18 @@ def main_function(experiment_directory, continue_from, batch_split):
                 # NN optimization
                 pred_sdf = decoder(input)
 
-                if enforce_minmax:
-                    pred_sdf = torch.clamp(pred_sdf, minT, maxT)
+                if field_type == "occupancy":
+                    # the decoder ends with tanh; map its output to (0, 1)
+                    pred_occ = 0.5 * (pred_sdf + 1.0)
+                    occ_gt = (sdf_gt[i] < 0).float().cuda()
+                    chunk_loss = F.binary_cross_entropy(
+                        pred_occ.clamp(1e-7, 1.0 - 1e-7), occ_gt, reduction="sum"
+                    ) / num_sdf_samples
+                else:
+                    if enforce_minmax:
+                        pred_sdf = torch.clamp(pred_sdf, minT, maxT)
 
-                chunk_loss = loss_l1(pred_sdf, sdf_gt[i].cuda()) / num_sdf_samples
+                    chunk_loss = loss_l1(pred_sdf, sdf_gt[i].cuda()) / num_sdf_samples
 
                 if do_code_regularization:
                     l2_size_loss = torch.sum(torch.norm(batch_vecs, dim=1))
@@ -515,6 +549,7 @@ def main_function(experiment_directory, continue_from, batch_split):
             logging.debug("loss = {}".format(batch_loss))
 
             loss_log.append(batch_loss)
+            epoch_losses.append(batch_loss)
 
             if grad_clip is not None:
 
@@ -526,6 +561,23 @@ def main_function(experiment_directory, continue_from, batch_split):
 
         seconds_elapsed = end - start
         timing_log.append(seconds_elapsed)
+
+        epoch_mean_loss = sum(epoch_losses) / max(1, len(epoch_losses))
+        epoch_loss_log.append(epoch_mean_loss)
+        if len(epoch_loss_log) > 1:
+            prev_mean = epoch_loss_log[-2]
+            delta_pct = 100.0 * (prev_mean - epoch_mean_loss) / max(abs(prev_mean), 1e-12)
+            logging.info(
+                "epoch {} mean loss = {:.6f} ({:+.2f}% vs previous epoch, {:.1f}s)".format(
+                    epoch, epoch_mean_loss, delta_pct, seconds_elapsed
+                )
+            )
+        else:
+            logging.info(
+                "epoch {} mean loss = {:.6f} ({:.1f}s)".format(
+                    epoch, epoch_mean_loss, seconds_elapsed
+                )
+            )
 
         lr_log.append([schedule.get_learning_rate(epoch) for schedule in lr_schedules])
 
@@ -548,6 +600,42 @@ def main_function(experiment_directory, continue_from, batch_split):
                 param_mag_log,
                 epoch,
             )
+
+        if (
+            early_stop_tol is not None
+            and epoch >= early_stop_min_epoch
+            and len(epoch_loss_log) >= 2 * early_stop_window
+        ):
+            recent = epoch_loss_log[-early_stop_window:]
+            previous = epoch_loss_log[-2 * early_stop_window : -early_stop_window]
+            recent_mean = sum(recent) / len(recent)
+            previous_mean = sum(previous) / len(previous)
+            improvement = (previous_mean - recent_mean) / max(
+                abs(previous_mean), 1e-12
+            )
+            logging.info(
+                "early-stop check: window improvement = {:.4%} (tol {:.4%})".format(
+                    improvement, early_stop_tol
+                )
+            )
+            if improvement < early_stop_tol:
+                logging.info(
+                    "early stopping at epoch {}: relative loss improvement "
+                    "{:.4%} < tolerance {:.4%}".format(
+                        epoch, improvement, early_stop_tol
+                    )
+                )
+                save_latest(epoch)
+                save_logs(
+                    experiment_directory,
+                    loss_log,
+                    lr_log,
+                    timing_log,
+                    lat_mag_log,
+                    param_mag_log,
+                    epoch,
+                )
+                break
 
 
 if __name__ == "__main__":

@@ -90,7 +90,7 @@ MESH_ABS_BOUND = 1.2
 
 
 def run_one_case(spec, cases_root, snapshots_root, grid_points, n_procs,
-                 skip_existing=False):
+                 skip_existing=False, keep_case=False):
     """STL -> case -> run -> sample -> validate one snapshot npz."""
     name = spec.get("name")
     shape_name = spec["shape"]
@@ -120,6 +120,8 @@ def run_one_case(spec, cases_root, snapshots_root, grid_points, n_procs,
         out_path, tuple(snap["fields"].shape), snap["bc"].tolist(),
         snap["shape"],
     )
+    if not keep_case:
+        shutil.rmtree(case_dir)
     return out_path
 
 
@@ -335,7 +337,7 @@ def snapshot_matches(path, bc, expected_points):
     )
 
 
-def run_batch_case(spec, template_dir, grid_points, n_procs):
+def run_batch_case(spec, template_dir, grid_points, n_procs, keep_case=False):
     """One batch case: clone template + foamlib edits -> run -> sample ->
     validate. Never raises; returns a result dict with status
     ok/failed (+ stage/error)."""
@@ -370,6 +372,8 @@ def run_batch_case(spec, template_dir, grid_points, n_procs):
             ),
         )
     else:
+        if not keep_case:
+            shutil.rmtree(spec["case_dir"], ignore_errors=True)
         result.update(status="ok")
     result["elapsed"] = round(time.time() - t0, 2)
     return result
@@ -536,7 +540,8 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
     ) as pool:
         futures = [
             pool.submit(
-                run_batch_case, spec, template_dir, grid_points, args.n_procs
+                run_batch_case, spec, template_dir, grid_points, args.n_procs,
+                args.keep_cases
             )
             for spec in specs
         ]
@@ -617,12 +622,17 @@ def main():
     parser.add_argument("--grid_stretch", action="store_true",
                         help="sample on the fixed anisotropic stretched grid "
                         "(dense near the body) instead of the uniform grid")
-    parser.add_argument("--grid_h_fine", type=float, default=0.027)
+    parser.add_argument("--grid_h_fine", type=float, default=0.022)
+    parser.add_argument("--grid_dense_half", type=float, default=1.1)
     parser.add_argument("--grid_domain", type=float, nargs=2,
                         default=(-1.5, 1.5))
     parser.add_argument("--n_procs", type=int, default=1,
                         help="MPI ranks per case (>1 needs mpiexec on PATH)")
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--keep_cases", action="store_true",
+                        help="keep the OpenFOAM case directories after "
+                        "successful sampling (default: delete them to save "
+                        "disk space; failures are always kept for debugging)")
     # Task 11 batch mode
     parser.add_argument("--lhs", type=int, default=0,
                         help="batch mode: number of latent-space LHS samples")
@@ -692,7 +702,8 @@ def main():
 
     if args.grid_stretch:
         grid_points, grid_shape, _ = make_stretched_grid(
-            hi=args.grid_domain[1], h_fine=args.grid_h_fine)
+            hi=args.grid_domain[1], h_fine=args.grid_h_fine,
+            dense_half=args.grid_dense_half)
     else:
         grid_points, grid_shape = make_reference_grid(
             args.grid_resolution, tuple(args.grid_domain)
@@ -712,7 +723,7 @@ def main():
         logging.info("=== case %s (bc=%s) ===",
                      spec.get("name", spec["shape"]), spec["bc"])
         run_one_case(spec, cases_root, snapshots_root, grid_points,
-                     args.n_procs, args.skip_existing)
+                     args.n_procs, args.skip_existing, args.keep_cases)
 
 
 if __name__ == "__main__":

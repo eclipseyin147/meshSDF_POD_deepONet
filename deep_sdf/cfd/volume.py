@@ -72,7 +72,7 @@ def make_reference_grid(resolution=64, domain=(-1.5, 1.5)):
     return grid_points, (n, n, n)
 
 
-def stretched_axis_coords(hi=1.5, dense_half=1.35, h_fine=0.027,
+def stretched_axis_coords(hi=1.5, dense_half=1.1, h_fine=0.022,
                           growth=1.35):
     """1D stretched grid coordinates on [-hi, hi]: uniform spacing
     ``h_fine`` inside [-dense_half, dense_half], then geometric growth
@@ -91,7 +91,7 @@ def stretched_axis_coords(hi=1.5, dense_half=1.35, h_fine=0.027,
     return np.array(neg + pts)
 
 
-def make_stretched_grid(hi=1.5, dense_half=1.35, h_fine=0.027,
+def make_stretched_grid(hi=1.5, dense_half=1.1, h_fine=0.022,
                         growth=1.35):
     """Fixed anisotropic reference grid (dual-resolution): dense near the
     body, coarse at the far field - one tensor-product grid, so every case
