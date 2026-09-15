@@ -165,3 +165,71 @@ def load_geometry_cache(cache_dir, name):
             "normal": torch.from_numpy(data["normal"]),
             "fluid_idx": torch.from_numpy(data["fluid_idx"]),
             "near_idx": torch.from_numpy(data["near_idx"])}
+
+
+def snapshot_index(snapshots_dir):
+    """Glob snapshot npz files and map internal 'shape' field -> path."""
+    import glob
+    idx = {}
+    for path in sorted(glob.glob(os.path.join(snapshots_dir, "*.npz"))):
+        data = np.load(path, allow_pickle=False)
+        if "shape" not in data.files:
+            continue
+        idx[str(data["shape"])] = path
+    return idx
+
+
+def load_shapes(names, latents, snap_idx, cache_dir, expected_points):
+    """Join manifest latents with snapshots (nondim u /= U at load) and the
+    geometry cache. All tensors CPU-resident."""
+    from deep_sdf.cfd.volume import load_snapshot
+    shapes = []
+    for i, name in enumerate(names):
+        if name not in snap_idx:
+            raise RuntimeError("no snapshot for manifest shape {}".format(name))
+        snap = load_snapshot(snap_idx[name], expected_points)
+        fields = snap["fields"].clone()
+        fields[:, :3] /= snap["bc"][0]
+        if not torch.isfinite(fields).all():
+            raise RuntimeError("non-finite fields in {}".format(snap_idx[name]))
+        geom = load_geometry_cache(cache_dir, name)
+        shapes.append({"name": name,
+                       "latent": torch.from_numpy(latents[i]).float(),
+                       "bc": snap["bc"].float(), "fields": fields, **geom})
+    return shapes
+
+
+def cluster_split(names, latents, n_clusters=12, seed=0):
+    """Roadmap section 30: k-means on z-scored latents, whole clusters
+    assigned 8/2/2 to train/val/test (cluster order shuffled by seed)."""
+    from scipy.cluster.vq import kmeans2
+    X = latents.astype(np.float64)
+    X = (X - X.mean(0)) / X.std(0).clip(1e-8)
+    _, labels = kmeans2(X, n_clusters, seed=seed, minit="++")
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_clusters)
+    groups = {"train": perm[:8], "val": perm[8:10], "test": perm[10:]}
+    out = {}
+    for key, clusters in groups.items():
+        member = set(int(c) for c in clusters)
+        out[key] = [n for n, lab in zip(names, labels) if int(lab) in member]
+    return out, labels
+
+
+def compute_stats(shapes, n_sample=4096, seed=0):
+    """z/bc/output-channel z-score statistics from the TRAIN shapes; the
+    output stats aggregate n_sample random fluid points per shape."""
+    z = torch.stack([s["latent"] for s in shapes])
+    bc = torch.stack([s["bc"] for s in shapes])
+    gen = torch.Generator().manual_seed(seed)
+    ys = []
+    for s in shapes:
+        pool = s["fluid_idx"]
+        pick = pool[torch.randint(0, pool.numel(),
+                                  (min(n_sample, pool.numel()),),
+                                  generator=gen)]
+        ys.append(s["fields"][pick])
+    Y = torch.cat(ys)
+    return {"z_mean": z.mean(0), "z_std": z.std(0).clamp_min(1e-8),
+            "bc_mean": bc.mean(0), "bc_std": bc.std(0).clamp_min(1e-8),
+            "y_mean": Y.mean(0), "y_std": Y.std(0).clamp_min(1e-8)}
