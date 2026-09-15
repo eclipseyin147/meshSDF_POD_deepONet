@@ -1,0 +1,72 @@
+# CI-only test dependencies layered on top of `uv sync --frozen`.
+#
+# Why a separate file (not pyproject extras):
+#   * Pure test tooling (moto) or no extras home (numpy-stl, scikit-image, ...).
+#   * PyG CUDA wheels live on a private index, not PyPI.
+#
+# Why every spec is `==`-pinned:
+#   testmon hashes site-packages content into its env fingerprint; any
+#   upstream release between the nightly that builds the testmon DB and
+#   the PR that consumes it would invalidate the entire cache.  Bumping a
+#   pin is a deliberate change: the next nightly repopulates the DB
+#   against the new fingerprint and PRs start hitting again.
+#
+# Why a companion `.github/ci-requirements.lock`:
+#   `==`-pinning the direct deps stabilises only the lines listed here.
+#   Several of them (moto, scikit-image, numpy-stl, shapely,
+#   multi-storage-client, tensorstore) are NOT in uv.lock, so their
+#   transitive closure (responses, xmltodict, jsonpath-ng, lazy-loader,
+#   tifffile, pywavelets, imageio, antlr4-python3-runtime, ...) gets
+#   resolved fresh against PyPI on every job and drifts between the
+#   nightly that builds the testmon DB and the PR that consumes it.  The
+#   companion `.github/ci-requirements.lock` (passed via `-c` in
+#   setup-uv-env) pins that closure so the fingerprint matches.
+#   Regenerate it whenever any `==` pin below changes; the three regen
+#   paths (nightly artifact, standalone workflow, local docker) are
+#   documented in .github/CACHE_CONTRACT.md under
+#   "Why a separate ci-requirements.lock".
+#
+# Coupling notes (bump in lockstep):
+#   * Dockerfile lines 240-243 still use `>=` lower bounds for the
+#     pure-PyPI specs; tighten in a follow-up.
+#   * On a torch upgrade, bump the PyG --find-links URL and the
+#     `+pt211cu128` label on the PyG pins together.
+#
+# earth2grid is intentionally NOT installed: the source build is fragile
+# in the CI container.  HEALPix tests skip via @requires_module until
+# earth2grid ships a wheel or the build is fixed.
+
+# PyG CUDA wheel index; the URL encodes the locked torch version.
+--find-links https://data.pyg.org/whl/torch-2.11.0+cu128.html
+
+# cuml-cu12 -> cudf -> numba caps numpy at <=2.2; uv.lock pins numpy
+# 2.2.6 under the cu12 extra for this reason.  Re-applied here so layered
+# installs (tensorstore, pyarrow, ...) cannot bump numpy to 2.4.x and
+# crash every test that touches cuml.
+numpy<2.3
+
+# Test tooling with no extras home.
+moto[s3]==5.2.1
+numpy-stl==3.2.0
+scikit-image==0.26.0
+shapely==2.1.2
+multi-storage-client[boto3]==0.48.0
+tensorstore==0.1.83
+pyarrow==24.0.0
+
+# PyG CUDA wheels.  `uv sync` installs the `gnns` extra as CPU-only
+# builds (no CUDA toolchain at build time), so CUDA tensors fail with
+# "Not compiled with CUDA support".  setup-uv-env swaps exactly these
+# four packages for the CUDA wheels via `--reinstall-package` (a bare
+# `--reinstall` would also refresh transitive deps and break ABI
+# compatibility with lockfile-pinned pyarrow / cudf / cuml).
+#
+# Keep the `+pt211cu128` label in the pins: PyPI rejects local versions,
+# so these pins can only be satisfied by the --find-links index above.
+# That blocks dependency confusion -- `pyg_lib` in particular is
+# unclaimed on PyPI (the team publishes there as `pyg_library`), so a
+# plain `==0.6.0` pin could match a squatted package.
+torch_scatter==2.1.2+pt211cu128
+torch_sparse==0.6.18+pt211cu128
+torch_cluster==1.6.3+pt211cu128
+pyg_lib==0.6.0+pt211cu128

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>DeepSDF Latent Explorer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #1a1d21; color: #ddd; overflow: hidden; }
+  #panel { position: fixed; top: 0; left: 0; width: 300px; max-height: 100vh; overflow-y: auto;
+           background: rgba(25,28,32,.92); padding: 12px; box-sizing: border-box; font-size: 13px; }
+  #panel h2 { font-size: 15px; margin: 4px 0 10px; }
+  #panel label { display: block; margin: 6px 0 2px; color: #9ab; }
+  #panel select, #panel button { width: 100%; margin: 2px 0; background: #2a2f36; color: #ddd;
+           border: 1px solid #444; border-radius: 4px; padding: 4px; }
+  #panel button:hover { background: #384049; cursor: pointer; }
+  .row { display: flex; gap: 6px; } .row > * { flex: 1; }
+  details { margin: 4px 0; } summary { cursor: pointer; color: #7fb3e0; }
+  .slider-row { display: flex; align-items: center; gap: 6px; margin: 1px 0; }
+  .slider-row label { width: 42px; margin: 0; font-size: 11px; color: #888; }
+  .slider-row input[type=range] { flex: 1; }
+  .slider-row .val { width: 52px; font-size: 11px; color: #aaa; text-align: right; }
+  #status { position: fixed; bottom: 8px; left: 316px; font-size: 12px; color: #8f8;
+            background: rgba(0,0,0,.5); padding: 4px 8px; border-radius: 4px; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h2>DeepSDF Latent Explorer</h2>
+  <label>预设形状</label>
+  <select id="preset"></select>
+  <div class="row">
+    <button id="randomBtn">随机 z</button>
+    <button id="resetBtn">重置</button>
+  </div>
+  <label>插值 A → B</label>
+  <div class="row">
+    <select id="interpA"></select><select id="interpB"></select>
+  </div>
+  <div class="slider-row">
+    <label>α</label>
+    <input type="range" id="interpAlpha" min="0" max="1" step="0.01" value="0.5">
+    <span class="val" id="interpAlphaVal">0.50</span>
+  </div>
+  <label>分辨率</label>
+  <select id="resolution">
+    <option value="63">63 (快)</option>
+    <option value="125" selected>125</option>
+    <option value="249">249 (精)</option>
+    <option value="349">349 (极精)</option>
+  </select>
+  <div id="latentSliders"></div>
+</div>
+<div id="status">connecting...</div>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
