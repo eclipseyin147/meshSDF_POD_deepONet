@@ -406,7 +406,7 @@ git commit -m "Add frozen DeepSDF decoder loader + SDF/normal geometry cache"
 **Interfaces:**
 - Consumes: Task 3 的 cache 接口；`deep_sdf.cfd.volume.load_snapshot(path, expected_points) -> dict(fields, bc, shape)`。
 - Produces:
-  - `snapshot_index(snapshots_dir: str) -> dict[str, str]`（shape 名 → 路径，自动排除 `_of4_view` 等不在 manifest 的文件由调用方交集处理）
+  - `snapshot_index(snapshots_dir: str) -> dict[str, str]`（shape 名 → 路径；`_of4_view` 等无 `_case` 的文件由文件名过滤排除）
   - `load_shapes(names list[str], latents (S,16) np, snap_idx dict, cache_dir str, expected_points int) -> list[dict]`；每个 dict：`{"name", "latent" (16,)f32, "bc" (4,)f32, "fields" (G,4)f32（已 /U 无量纲）, "sdf" (G,), "normal" (G,3), "fluid_idx", "near_idx"}`，全部 CPU
   - `cluster_split(names, latents (S,16) np, n_clusters int, seed int) -> (dict["train"/"val"/"test" -> list[str]], labels np (S,))`（z-score → kmeans2(minit="++") → 簇 shuffle 后 8/2/2 分）
   - `compute_stats(shapes list[dict], n_sample int, seed int) -> dict`：`z_mean/z_std (16,)`、`bc_mean/bc_std (4,)`、`y_mean/y_std (4,)`（CPU tensors，std 钳 1e-8；y 统计=每形状随机 n_sample 流体点聚合）
