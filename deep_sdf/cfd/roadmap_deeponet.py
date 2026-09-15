@@ -233,3 +233,82 @@ def compute_stats(shapes, n_sample=4096, seed=0):
     return {"z_mean": z.mean(0), "z_std": z.std(0).clamp_min(1e-8),
             "bc_mean": bc.mean(0), "bc_std": bc.std(0).clamp_min(1e-8),
             "y_mean": Y.mean(0), "y_std": Y.std(0).clamp_min(1e-8)}
+
+
+def sample_case_batch(shape, grid_points, n_points, near_frac, gen, device):
+    """Draw n_points from one shape: near_frac from the near-wall pool, the
+    rest uniform fluid; returns GPU tensors ready for predict_normalized."""
+    n_near = int(round(n_points * near_frac))
+    pool_near, pool_fluid = shape["near_idx"], shape["fluid_idx"]
+    take_near = min(n_near, pool_near.numel())
+    take_fluid = n_points - take_near
+    idx = torch.cat([
+        pool_near[torch.randint(0, pool_near.numel(), (take_near,),
+                                generator=gen)],
+        pool_fluid[torch.randint(0, pool_fluid.numel(), (take_fluid,),
+                                 generator=gen)]])
+    return {"latent": shape["latent"].to(device),
+            "bc": shape["bc"].to(device),
+            "xyz": grid_points[idx].to(device),
+            "sdf": shape["sdf"][idx].unsqueeze(1).to(device),
+            "normal": shape["normal"][idx].to(device),
+            "y": shape["fields"][idx].to(device)}
+
+
+@torch.no_grad()
+def evaluate(model, shapes, grid_points, stats, cfg, n_points, seed,
+             chunk=2 ** 18):
+    """Physical-space per-variable rel L2 on a fixed-seed fluid subsample
+    per shape; baseline predicts the train channel mean (y_mean)."""
+    import zlib
+    device = next(model.parameters()).device
+    stats_g = {k: v.to(device) for k, v in stats.items()}
+    per_var, per_case, baselines = [], {}, []
+    for s in shapes:
+        gen = torch.Generator().manual_seed(
+            seed + zlib.crc32(s["name"].encode()))
+        pool = s["fluid_idx"]
+        idx = pool[torch.randperm(pool.numel(), generator=gen)[:n_points]]
+        xyz = grid_points[idx].to(device)
+        sdf = s["sdf"][idx].unsqueeze(1).to(device)
+        normal = s["normal"][idx].to(device)
+        y = s["fields"][idx].to(device)
+        preds = []
+        for head in range(0, idx.numel(), chunk):
+            sl = slice(head, min(head + chunk, idx.numel()))
+            pn = predict_normalized(
+                model, s["latent"].to(device), s["bc"].to(device),
+                xyz[sl], sdf[sl], normal[sl], stats_g, cfg, amp=False)
+            preds.append(pn * stats_g["y_std"] + stats_g["y_mean"])
+        pred = torch.cat(preds)
+        rel_v = [((pred[:, v] - y[:, v]).norm() /
+                  y[:, v].norm().clamp_min(1e-12)).item() for v in range(4)]
+        per_var.append(rel_v)
+        per_case[s["name"]] = float(np.mean(rel_v))
+        baselines.append([((stats_g["y_mean"][v] - y[:, v]).norm() /
+                           y[:, v].norm().clamp_min(1e-12)).item()
+                          for v in range(4)])
+    return {"rel_l2": float(np.mean([np.mean(r) for r in per_var])),
+            "per_var": [float(np.mean([r[v] for r in per_var]))
+                        for v in range(4)],
+            "baseline": float(np.mean([np.mean(b) for b in baselines])),
+            "per_case": per_case}
+
+
+@torch.no_grad()
+def predict_field(model, shape, grid_points, stats, cfg, chunk=2 ** 18):
+    """Full-grid physical-space prediction (G,4), fp32, chunked."""
+    device = next(model.parameters()).device
+    stats_g = {k: v.to(device) for k, v in stats.items()}
+    lat = shape["latent"].to(device)
+    bc = shape["bc"].to(device)
+    out = []
+    for head in range(0, grid_points.shape[0], chunk):
+        sl = slice(head, min(head + chunk, grid_points.shape[0]))
+        xyz = grid_points[sl].to(device)
+        sdf = shape["sdf"][sl].unsqueeze(1).to(device)
+        normal = shape["normal"][sl].to(device)
+        pn = predict_normalized(model, lat, bc, xyz, sdf, normal,
+                                stats_g, cfg, amp=False)
+        out.append((pn * stats_g["y_std"] + stats_g["y_mean"]).cpu())
+    return torch.cat(out)
