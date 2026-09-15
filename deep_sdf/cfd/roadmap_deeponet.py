@@ -172,6 +172,8 @@ def snapshot_index(snapshots_dir):
     import glob
     idx = {}
     for path in sorted(glob.glob(os.path.join(snapshots_dir, "*.npz"))):
+        if "_case" not in os.path.basename(path):
+            continue
         data = np.load(path, allow_pickle=False)
         if "shape" not in data.files:
             continue

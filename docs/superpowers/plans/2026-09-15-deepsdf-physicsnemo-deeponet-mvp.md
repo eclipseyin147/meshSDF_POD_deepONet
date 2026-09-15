@@ -16,7 +16,7 @@
 - 训练产物（`examples/ellipsoids/RoadmapONet*/`、`data/openfoam/ellipsoids_u10/sdf_cache/`）**不入 git**；只提交代码文件。
 - 关键数据事实（实现者须知）：
   - manifest：`data/openfoam/ellipsoids_u10/lhs_latents.npz`（`names (281,)` str、`latents (281,16)` f32；名字形如 `ellipsoids/ellipsoid/ellipsoid_a0.5_b0.5_c0.5.npz` 与 `lhs/shape_XXX.npz`）。
-  - 快照：`snapshots/*.npz`（282 个文件，含 1 个 `_of4_view` 须排除），内部 `shape` 字段 == manifest 名；`fields (1442897,4)` f32 = **[u_raw(m/s)×3, Cp]**（体内点已置 u=0/Cp=1，无哨兵）；加载时 `fields[:,:3] /= bc[0]` 无量纲化。
+  - 快照：`snapshots/*.npz`（282 个文件，含 1 个 `_of4_view`，由 snapshot_index 的 `_case` 文件名过滤排除），内部 `shape` 字段 == manifest 名；`fields (1442897,4)` f32 = **[u_raw(m/s)×3, Cp]**（体内点已置 u=0/Cp=1，无哨兵）；加载时 `fields[:,:3] /= bc[0]` 无量纲化。
   - 参考网格：`deep_sdf.cfd.volume.make_stretched_grid()` 默认参数 → `grid_points (1442897,3)` f32，**域 [-1.5,1.5]³**（不是 [-9,9]³）；`domain_half=1.5`。
   - decoder：specs 在 `examples/ellipsoids_of4/specs.json`（CodeLength=16，dims=[128]×4，latent_in=[2]，use_tanh=false，但 forward 末尾恒有 `self.th=nn.Tanh()` → 输出∈(-1,1)，近壁带阈值 0.15 作用在该 tanh 空间）；权重 `examples/ellipsoids/ModelParameters/latest.pth`，state_dict 键带 `module.` 前缀（训练时 DataParallel 保存）。
   - xDeepONet core 模式语义：`model(x_branch (B,20), x_trunk (T,43)) -> (B,T,4)`，**同一组 trunk 查询点施加于 batch 内每个 branch**；各 case 查询点不同（SDF/法向不同），故前向必须**逐 case**（B=1）调用。
