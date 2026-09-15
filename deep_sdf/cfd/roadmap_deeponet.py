@@ -7,10 +7,14 @@ xDeepONet Hadamard + mlp decoder -> [u, v, w, Cp] (normalized space).
 Data/geometry/split/eval helpers are appended by later tasks.
 """
 
+import json
+import os
+
 import numpy as np
 import torch
 
 from deep_sdf.cfd import physicsnemo_compat as _physicsnemo_compat  # noqa: F401
+from deep_sdf.utils import decode_sdf
 
 DEFAULT_CFG = {
     # model
@@ -87,3 +91,77 @@ def predict_normalized(model, latent, bc, xyz, sdf, normal, stats, cfg,
     with torch.amp.autocast("cuda", dtype=torch.float16, enabled=amp):
         y = model(xb, xt)[0]                                  # (N, 4)
     return y.float()
+
+
+def load_frozen_decoder(specs_path, experiment_dir, checkpoint="latest"):
+    """Rebuild the DeepSDF autodecoder from specs.json + ModelParameters
+    checkpoint (trained with DataParallel -> strip the 'module.' prefix).
+    Returns (decoder cuda/eval/frozen, latent_size)."""
+    specs = json.load(open(specs_path))
+    arch = __import__("networks." + specs["NetworkArch"], fromlist=["Decoder"])
+    decoder = arch.Decoder(specs["CodeLength"], **specs["NetworkSpecs"])
+    path = os.path.join(experiment_dir, "ModelParameters", checkpoint + ".pth")
+    saved = torch.load(path, map_location="cpu")
+    state = saved["model_state_dict"]
+    if any(k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
+    decoder.load_state_dict(state)
+    decoder = decoder.cuda().eval()
+    for p in decoder.parameters():
+        p.requires_grad_(False)
+    return decoder, specs["CodeLength"]
+
+
+def cache_key(name):
+    """Manifest shape name -> cache file stem ('lhs/shape_001.npz' ->
+    'lhs_shape_001'; mirrors volume.snapshot_filename's '/'->'_')."""
+    return name[:-4].replace("/", "_") if name.endswith(".npz") \
+        else name.replace("/", "_")
+
+
+def build_geometry_cache(decoder, name_latents, grid_points, cache_dir,
+                         near_band=0.15, chunk=2 ** 18):
+    """Per shape: chunked frozen-decoder SDF + autograd gradient on the
+    shared grid; unit normal; fluid mask (sdf>0) and near-wall mask
+    (|sdf|<near_band, tanh space). Writes sdf_cache/<cache_key>.npz with
+    keys sdf (G,)f32 / normal (G,3)f32 / fluid_idx / near_idx (int64).
+    Existing files are skipped."""
+    os.makedirs(cache_dir, exist_ok=True)
+    gp = grid_points.cuda()
+    n_total = grid_points.shape[0]
+    for i, (name, latent) in enumerate(name_latents):
+        out = os.path.join(cache_dir, cache_key(name) + ".npz")
+        if os.path.isfile(out):
+            continue
+        lat = latent.reshape(1, -1).float().cuda()
+        sdf_chunks, grad_chunks = [], []
+        for head in range(0, n_total, chunk):
+            q = gp[head:head + chunk].clone().requires_grad_(True)
+            d = decode_sdf(decoder, lat, q)
+            g = torch.autograd.grad(d.sum(), q)[0]
+            sdf_chunks.append(d.detach().squeeze(1).float().cpu())
+            grad_chunks.append(g.detach().float().cpu())
+        sdf = torch.cat(sdf_chunks)
+        grad = torch.cat(grad_chunks)
+        normal = grad / grad.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        fluid = torch.nonzero(sdf > 0).squeeze(1)
+        near = torch.nonzero(sdf.abs() < near_band).squeeze(1)
+        if fluid.numel() == 0:
+            raise RuntimeError("no fluid points for shape {}".format(name))
+        if near.numel() == 0:
+            near = fluid
+        np.savez(out, sdf=sdf.numpy().astype(np.float32),
+                 normal=normal.numpy().astype(np.float32),
+                 fluid_idx=fluid.numpy().astype(np.int64),
+                 near_idx=near.numpy().astype(np.int64))
+        print("[cache] %d/%d %s (fluid %d, near %d)" % (
+            i + 1, len(name_latents), name, fluid.numel(), near.numel()))
+
+
+def load_geometry_cache(cache_dir, name):
+    path = os.path.join(cache_dir, cache_key(name) + ".npz")
+    data = np.load(path)
+    return {"sdf": torch.from_numpy(data["sdf"]),
+            "normal": torch.from_numpy(data["normal"]),
+            "fluid_idx": torch.from_numpy(data["fluid_idx"]),
+            "near_idx": torch.from_numpy(data["near_idx"])}
