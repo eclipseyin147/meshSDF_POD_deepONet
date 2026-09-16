@@ -1459,7 +1459,6 @@ def run_physics_stage(args, cfg):
     opt = torch.optim.AdamW(model.parameters(),
                             lr=cfg["lr"] * cfg["phys_lr_scale"],
                             weight_decay=cfg["weight_decay"])
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"])
     lambda_fixed = args.lambda_phys
 
     def lr_at(it):
@@ -1531,9 +1530,8 @@ def run_physics_stage(args, cfg):
                               "wall": float(lw), "far": float(lf),
                               "lambda_phys": lam}
         loss = loss / len(cases)
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
+        loss.backward()
+        opt.step()
 
         if (it + 1) % cfg["metrics_every"] == 0 or it == start_iter:
             rec = {"iter": it + 1, "train_loss": float(loss.item()),
@@ -1609,6 +1607,8 @@ main() 中 physics 占位（`raise SystemExit("physics stage is added by a later
 ```
 
 同时 parse_args 的 `--stage` choices 已含 "physics"（Task 6 接线时已列入），若 Task 6 未列入则补上。
+
+注意：physics stage 不用 GradScaler（PDE 逐 chunk backward 与 scaler.unscale 冲突会稀释 PDE 梯度 ~1/scale；autocast fp16 仅用于数据前向）——2026-09-16 审查修复。
 
 - [ ] **Step 4: smoke + 正式训练 + 评估**
 

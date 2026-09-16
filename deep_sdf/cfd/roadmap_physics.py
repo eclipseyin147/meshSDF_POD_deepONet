@@ -155,7 +155,6 @@ def run_physics_stage(args, cfg):
     opt = torch.optim.AdamW(model.parameters(),
                             lr=cfg["lr"] * cfg["phys_lr_scale"],
                             weight_decay=cfg["weight_decay"])
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"])
     lambda_fixed = args.lambda_phys
 
     def lr_at(it):
@@ -227,9 +226,8 @@ def run_physics_stage(args, cfg):
                               "wall": float(lw), "far": float(lf),
                               "lambda_phys": lam}
         loss = loss / len(cases)
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
+        loss.backward()
+        opt.step()
 
         if (it + 1) % cfg["metrics_every"] == 0 or it == start_iter:
             rec = {"iter": it + 1, "train_loss": float(loss.item()),
