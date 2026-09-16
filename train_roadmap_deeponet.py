@@ -39,6 +39,12 @@ def parse_args():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--iters", type=int, default=None)
+    p.add_argument("--out_name", default=None,
+                   help="output dir under <experiment>/ (default "
+                        "RoadmapONet, or RoadmapONet_smoke with --smoke)")
+    p.add_argument("--analyze", action="store_true",
+                   help="write analysis.json (near/far masked per-case "
+                        "errors, worst-10) from <out_name>/best.mdlus")
     return p.parse_args()
 
 
@@ -53,8 +59,9 @@ def main():
     if args.smoke:
         cfg.update(iters=500, eval_every=100, eval_points=4096)
 
-    out_dir = os.path.join(args.experiment_directory,
-                           "RoadmapONet_smoke" if args.smoke else "RoadmapONet")
+    out_name = args.out_name or (
+        "RoadmapONet_smoke" if args.smoke else "RoadmapONet")
+    out_dir = os.path.join(args.experiment_directory, out_name)
     os.makedirs(out_dir, exist_ok=True)
     seed = cfg["seed"]
     torch.manual_seed(seed)
@@ -131,6 +138,53 @@ def main():
                           n_points=n_points, seed=12345)
         model.train()
         return res
+
+    if args.analyze:
+        from physicsnemo.experimental.models.xdeeponet.deeponet import (
+            DeepONet)
+        model = DeepONet.from_checkpoint(
+            os.path.join(out_dir, "best.mdlus")).to(device).eval()
+        val_shapes = load(split["val"])
+        test_shapes = load(split["test"])
+        lat_t = torch.from_numpy(latents).float()
+        label_map = {n: int(l) for n, l in zip(names, labels)}
+        # 簇心只用 train 形状的 latent；val/test 的簇按 cluster_split 不含
+        # train 成员，故 dist_to_centroid 取到最近 train 簇心的距离
+        train_idx = [names.index(n) for n in split["train"]]
+        centroids = {}
+        for c in np.unique(labels[train_idx]):
+            rows = [i for i in train_idx if labels[i] == c]
+            centroids[int(c)] = lat_t[rows].mean(0)
+
+        out = {"cases": []}
+        for split_name, shapes in (("val", val_shapes),
+                                   ("test", test_shapes)):
+            det = rd.evaluate_detailed(
+                model, shapes, grid_points, stats_g, cfg,
+                n_points=cfg["analyze_points"], seed=777)
+            for nm, rec in det["cases"].items():
+                zi = lat_t[names.index(nm)]
+                cen = min(centroids.values(),
+                          key=lambda c: float((zi - c).norm()))
+                rec = dict(rec)
+                rec.update(split=split_name, name=nm,
+                           cluster=label_map[nm],
+                           dist_to_centroid=float((zi - cen).norm()))
+                out["cases"].append(rec)
+        out["cases"].sort(key=lambda r: -r["rel_l2"])
+        out["worst10"] = [r["name"] for r in out["cases"][:10]]
+        with open(os.path.join(out_dir, "analysis.json"), "w") as f:
+            json.dump(out, f, indent=1)
+        logging.info("worst-10 by rel_l2:")
+        for r in out["cases"][:10]:
+            logging.info("  %-58s %s rel %.4f near %s far %s cluster %d "
+                         "dist %.3f", r["name"], r["split"], r["rel_l2"],
+                         "%.4f" % r["near_rel"] if r["near_rel"] is not None
+                         else "n/a",
+                         "%.4f" % r["far_rel"] if r["far_rel"] is not None
+                         else "n/a",
+                         r["cluster"], r["dist_to_centroid"])
+        return
 
     if args.eval_only:
         from physicsnemo.experimental.models.xdeeponet.deeponet import DeepONet

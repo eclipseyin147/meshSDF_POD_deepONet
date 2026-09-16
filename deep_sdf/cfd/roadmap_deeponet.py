@@ -32,6 +32,8 @@ DEFAULT_CFG = {
     "eval_points": 16384, "final_eval_points": 65536,
     # split / stats
     "n_clusters": 12, "seed": 0, "stats_sample": 4096,
+    # analysis / adaptive sampling
+    "analyze_points": 65536, "adaptive_points": 4096, "adaptive_eps": 0.1,
 }
 
 OUT_VARS = ("u", "v", "w", "p")
@@ -314,3 +316,92 @@ def predict_field(model, shape, grid_points, stats, cfg, chunk=2 ** 18):
                                 stats_g, cfg, amp=False)
         out.append((pn * stats_g["y_std"] + stats_g["y_mean"]).cpu())
     return torch.cat(out)
+
+
+def prepare_experiment(experiment_dir, specs_path, checkpoint, data_root,
+                       cfg):
+    """Shared data pipeline for analysis / surface / physics stages: frozen
+    decoder geometry cache (built if missing), snapshot index, cluster
+    split, train shapes + stats, and a lazy shape loader. Returns the dict
+    documented in the plan (grid_points/grid_shape/axis/names/latents/
+    split/labels/snap_idx/cache_dir/train_shapes/stats/load)."""
+    from deep_sdf.cfd.volume import make_stretched_grid
+    from generate_openfoam_snapshots import load_manifest
+    decoder, _ = load_frozen_decoder(specs_path, experiment_dir, checkpoint)
+    grid_points, grid_shape, axis = make_stretched_grid()
+    names, latents = load_manifest(
+        os.path.join(data_root, "lhs_latents.npz"))
+    cache_dir = os.path.join(data_root, "sdf_cache")
+    build_geometry_cache(
+        decoder, [(n, torch.from_numpy(latents[i]))
+                  for i, n in enumerate(names)],
+        grid_points, cache_dir, near_band=cfg["near_band"])
+    del decoder
+    torch.cuda.empty_cache()
+    snap_idx = snapshot_index(os.path.join(data_root, "snapshots"))
+    split, labels = cluster_split(names, latents,
+                                  n_clusters=cfg["n_clusters"],
+                                  seed=cfg["seed"])
+    n_grid = grid_points.shape[0]
+
+    def load(name_list):
+        sel = [names.index(n) for n in name_list]
+        return load_shapes(name_list, latents[sel], snap_idx, cache_dir,
+                           n_grid)
+
+    train_shapes = load(split["train"])
+    stats = compute_stats(train_shapes, n_sample=cfg["stats_sample"],
+                          seed=cfg["seed"])
+    return {"grid_points": grid_points, "grid_shape": grid_shape,
+            "axis": axis, "names": names, "latents": latents,
+            "split": split, "labels": labels, "snap_idx": snap_idx,
+            "cache_dir": cache_dir, "train_shapes": train_shapes,
+            "stats": stats, "load": load}
+
+
+@torch.no_grad()
+def evaluate_detailed(model, shapes, grid_points, stats, cfg, n_points, seed,
+                      near_band=0.15, chunk=2 ** 18):
+    """evaluate() plus per-case near-wall (|sdf|<near_band) vs far masked
+    rel L2. Returns {"cases": {name: {"rel_l2", "per_var", "near_rel",
+    "far_rel"}}}; a mask subset that is empty yields None for that entry."""
+    import zlib
+    device = next(model.parameters()).device
+    stats_g = {k: v.to(device) for k, v in stats.items()}
+    cases = {}
+    for s in shapes:
+        gen = torch.Generator().manual_seed(
+            seed + zlib.crc32(s["name"].encode()))
+        pool = s["fluid_idx"]
+        idx = pool[torch.randperm(pool.numel(), generator=gen)[:n_points]]
+        xyz = grid_points[idx].to(device)
+        sdf = s["sdf"][idx].unsqueeze(1).to(device)
+        normal = s["normal"][idx].to(device)
+        y = s["fields"][idx].to(device)
+        preds = []
+        for head in range(0, idx.numel(), chunk):
+            sl = slice(head, min(head + chunk, idx.numel()))
+            pn = predict_normalized(
+                model, s["latent"].to(device), s["bc"].to(device),
+                xyz[sl], sdf[sl], normal[sl], stats_g, cfg, amp=False)
+            preds.append(pn * stats_g["y_std"] + stats_g["y_mean"])
+        pred = torch.cat(preds)
+        rel_v = [((pred[:, v] - y[:, v]).norm() /
+                  y[:, v].norm().clamp_min(1e-12)).item() for v in range(4)]
+
+        def masked_rel(mask):
+            if int(mask.sum()) == 0:
+                return None
+            return float(np.mean([
+                ((pred[mask, v] - y[mask, v]).norm() /
+                 y[mask, v].norm().clamp_min(1e-12)).item()
+                for v in range(4)]))
+
+        near = sdf.squeeze(1).abs() < near_band
+        cases[s["name"]] = {
+            "rel_l2": float(np.mean(rel_v)),
+            "per_var": [float(r) for r in rel_v],
+            "near_rel": masked_rel(near),
+            "far_rel": masked_rel(~near),
+        }
+    return {"cases": cases}
