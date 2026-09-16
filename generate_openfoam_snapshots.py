@@ -629,6 +629,9 @@ def main():
     parser.add_argument("--n_procs", type=int, default=1,
                         help="MPI ranks per case (>1 needs mpiexec on PATH)")
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--surface_only", action="store_true",
+                        help="re-run cases only to export wall surface "
+                             "fields (DeepONet v2 W2a)")
     parser.add_argument("--keep_cases", action="store_true",
                         help="keep the OpenFOAM case directories after "
                         "successful sampling (default: delete them to save "
@@ -679,8 +682,16 @@ def main():
     parser.add_argument("--limit_ellipsoids", type=int, default=None,
                         help="batch mode: only run the first K split "
                         "ellipsoids")
+    parser.add_argument("--checkpoint", default="latest",
+                        help="decoder checkpoint name under "
+                        "<experiment>/ModelParameters/ (used by "
+                        "--surface_only)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
+
+    if args.surface_only:
+        run_surface_batch(args)
+        return
 
     if args.latents is None:
         args.latents = os.path.join(
@@ -724,6 +735,109 @@ def main():
                      spec.get("name", spec["shape"]), spec["bc"])
         run_one_case(spec, cases_root, snapshots_root, grid_points,
                      args.n_procs, args.skip_existing, args.keep_cases)
+
+
+# --------------------------------------------------------------------------
+# DeepONet v2 W2a: wall-surface field re-export
+# --------------------------------------------------------------------------
+
+def run_surface_case(spec, template_dir, decoder, keep_case=False):
+    """One surface case: clone template -> run -> export surface npz ->
+    validate. Never raises; returns a result dict."""
+    result = {"shape": spec["shape"]}
+    t0 = time.time()
+    stage = "case setup"
+    try:
+        make_case_from_template(
+            template_dir, spec["case_dir"], spec["stl"], spec["bc"])
+        stage = "meshing/solver"
+        openfoam_runner.run_case(spec["case_dir"], n_procs=1)
+        stage = "surface export"
+        openfoam_runner.export_surface(
+            spec["case_dir"], spec["out_path"], spec["bc"], decoder,
+            spec["latent"])
+        stage = "validation"
+        openfoam_runner.validate_surface_npz(spec["out_path"])
+    except Exception as e:
+        result.update(status="failed", stage=stage,
+                      error="{}: {}".format(type(e).__name__, e))
+    else:
+        if not keep_case:
+            shutil.rmtree(spec["case_dir"], ignore_errors=True)
+        result.update(status="ok")
+    result["elapsed"] = round(time.time() - t0, 2)
+    return result
+
+
+def run_surface_batch(args):
+    """Re-run all manifest shapes at their existing snapshot BC and export
+    wall surface fields to <root>/surface/<cache_key>.npz."""
+    from deep_sdf.cfd.roadmap_deeponet import cache_key
+    root = args.root
+    stl_dir = os.path.join(root, "stls")
+    surface_root = os.path.join(root, "surface")
+    cases_root = os.path.join(root, "cases")
+    snapshots_root = os.path.join(root, "snapshots")
+    os.makedirs(surface_root, exist_ok=True)
+    os.makedirs(cases_root, exist_ok=True)
+    names, latents = load_manifest(os.path.join(root, "lhs_latents.npz"))
+    decoder, _ = load_decoder(args.experiment, args.checkpoint)
+    decoder = decoder.cuda()
+    template_dir = os.path.join(root, "template_case")
+    ensure_template_case(template_dir)
+    specs = []
+    skipped = 0
+    for i, name in enumerate(names):
+        out_path = os.path.join(surface_root, cache_key(name) + ".npz")
+        if args.skip_existing and os.path.isfile(out_path):
+            try:
+                openfoam_runner.validate_surface_npz(out_path)
+                skipped += 1
+                continue
+            except RuntimeError:
+                pass
+        stl = _stl_cache_path(stl_dir, name)
+        if not os.path.isfile(stl):
+            raise RuntimeError("missing STL for shape {}: {}".format(
+                name, stl))
+        snap_path = os.path.join(
+            snapshots_root, snapshot_filename(name, 0))
+        bc = np.load(snap_path)["bc"]
+        specs.append({"shape": name, "latent": latents[i], "stl": stl,
+                      "bc": bc,
+                      "case_dir": os.path.join(
+                          cases_root, cache_key(name) + "_surface"),
+                      "out_path": out_path})
+    logging.info("surface batch: %d to run, %d skipped (valid existing)",
+                 len(specs), skipped)
+    results, t0, done = [], time.time(), 0
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(args.jobs)) as pool:
+        futures = [pool.submit(run_surface_case, s, template_dir, decoder,
+                               args.keep_cases) for s in specs]
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            results.append(res)
+            done += 1
+            if res["status"] == "ok":
+                logging.info("surface %d/%d %s: ok in %.1fs", done,
+                             len(specs), res["shape"], res["elapsed"])
+            else:
+                logging.warning("surface %d/%d %s: FAILED at %s: %s",
+                                done, len(specs), res["shape"],
+                                res["stage"], res["error"])
+    ok = sum(1 for r in results if r["status"] == "ok")
+    summary = {"total": len(specs) + skipped, "ran": len(specs),
+               "ok": ok, "skipped": skipped,
+               "failed": [r for r in results if r["status"] != "ok"],
+               "elapsed_sec": round(time.time() - t0, 1)}
+    with open(os.path.join(surface_root, "surface_summary.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+    logging.info("surface batch done: %d ok / %d failed / %d skipped",
+                 ok, len(specs) - ok, skipped)
+    if ok + skipped != len(names):
+        raise SystemExit("surface batch incomplete: {}".format(
+            os.path.join(surface_root, "surface_summary.json")))
 
 
 if __name__ == "__main__":
