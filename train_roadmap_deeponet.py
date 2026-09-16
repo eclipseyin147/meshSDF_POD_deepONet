@@ -48,6 +48,13 @@ def parse_args():
     p.add_argument("--adaptive_sampling", action="store_true",
                    help="shape-level error-adaptive case sampling "
                         "(spec section 4.2)")
+    p.add_argument("--stage", choices=["field", "surface", "physics"],
+                   default="field")
+    p.add_argument("--init_from", default=None,
+                   help="checkpoint to init surface/physics stages from "
+                        "(default <experiment>/RoadmapONet/best.mdlus)")
+    p.add_argument("--lambda_phys", type=float, default=None,
+                   help="fixed physics loss weight (default: schedule)")
     return p.parse_args()
 
 
@@ -66,6 +73,13 @@ def main():
         "RoadmapONet_smoke" if args.smoke else "RoadmapONet")
     out_dir = os.path.join(args.experiment_directory, out_name)
     os.makedirs(out_dir, exist_ok=True)
+    args._out_dir = out_dir
+    if args.stage == "surface":
+        raise SystemExit("surface stage: see Task 6")
+    if args.stage == "physics":
+        from deep_sdf.cfd import roadmap_physics
+        roadmap_physics.run_physics_stage(args, cfg)
+        return
     seed = cfg["seed"]
     torch.manual_seed(seed)
     np.random.seed(seed)

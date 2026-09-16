@@ -40,6 +40,9 @@ DEFAULT_CFG = {
     "surface_points": 4096, "lambda_force": 1.0,
     "lambda_consistency": 0.1, "branch_lr_scale": 0.1,
     "surface_iters": 10000,
+    # physics stage
+    "n_collocation": 4096, "phys_chunk": 256, "lambda_phys": None,
+    "physics_iters": 10000, "re": 100.0, "phys_lr_scale": 0.1,
 }
 
 OUT_VARS = ("u", "v", "w", "p")
