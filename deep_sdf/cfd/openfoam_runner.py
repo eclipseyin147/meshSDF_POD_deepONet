@@ -41,6 +41,7 @@ semi-axis <= 0.9 centered at the origin, domain [-9, 9]^3 (>5x the longest
 full axis), U of O(10), kinematic viscosity nu = 0.1 (Re ~ 270, laminar).
 """
 
+import glob
 import logging
 import os
 import shutil
@@ -852,3 +853,205 @@ def sample_to_snapshot(case_dir, grid_points, shape_name, bc, out_path,
     )
     save_snapshot(out_path, fields, np.asarray([U] + list(direction)), shape_name)
     return out_path
+
+
+# --------------------------------------------------------------------------
+# Surface field export (DeepONet v2 spec section 3)
+# --------------------------------------------------------------------------
+
+def decoder_normals(decoder, latent, points, max_batch=2 ** 17, eps=1e-8):
+    """Unit outward SDF normals at query points from a frozen DeepSDF
+    decoder (autograd gradient of decode_sdf, normalized)."""
+    import deep_sdf.utils
+    device = next(decoder.parameters()).device
+    lat = torch.as_tensor(latent, dtype=torch.float32).reshape(1, -1).to(device)
+    pts = torch.as_tensor(points, dtype=torch.float32).reshape(-1, 3)
+    outs = []
+    for lo in range(0, pts.shape[0], max_batch):
+        q = pts[lo:lo + max_batch].to(device).requires_grad_(True)
+        d = deep_sdf.utils.decode_sdf(decoder, lat, q)
+        g = torch.autograd.grad(d.sum(), q)[0]
+        outs.append((g / g.norm(dim=1, keepdim=True).clamp_min(eps)).cpu())
+    return torch.cat(outs).numpy().astype(np.float32)
+
+
+def reference_area_from_faces(normals, areas, direction):
+    """A_ref = sum_f max(0, -n_f . dir) * A_f (labels.reference_area 约定)."""
+    n = torch.as_tensor(normals, dtype=torch.float32).reshape(-1, 3)
+    a = torch.as_tensor(areas, dtype=torch.float32).reshape(-1)
+    v = torch.as_tensor(direction, dtype=torch.float32).reshape(3)
+    v = v / v.norm()
+    return (torch.clamp(-(n @ v), min=0.0) * a).sum()
+
+
+def integrate_cd_cl(cp, cf, normals, areas, direction):
+    """F = -sum cp*n*A + sum cf*A (n = outward unit normal); returns
+    (cd, cl) = (F.dir/A_ref, F_z/A_ref) as torch float32 scalars."""
+    cp = torch.as_tensor(cp, dtype=torch.float32).reshape(-1)
+    cf = torch.as_tensor(cf, dtype=torch.float32).reshape(-1, 3)
+    n = torch.as_tensor(normals, dtype=torch.float32).reshape(-1, 3)
+    a = torch.as_tensor(areas, dtype=torch.float32).reshape(-1)
+    v = torch.as_tensor(direction, dtype=torch.float32).reshape(3)
+    v = v / v.norm()
+    force = -(cp.unsqueeze(1) * n * a.unsqueeze(1)).sum(0) \
+        + (cf * a.unsqueeze(1)).sum(0)
+    a_ref = reference_area_from_faces(n, a, v)
+    return (force @ v) / a_ref, force[2] / a_ref
+
+
+def _surface_dict(name="surfaces", patch_regex=".*body.*"):
+    # OF14 difference: surfaceFormat vtp does not exist in OpenFOAM.org 14
+    # (writers: ensight/foam/none/raw/vtk) - legacy vtk is used instead and
+    # the output file is wall.vtk.
+    out = _foam_header(name)
+    out += """%s
+{
+    type                surfaces;
+    libs                ("libsampling.so");
+    writeControl        timeStep;
+    writeInterval       1;
+    interpolationScheme cell;
+    surfaceFormat       vtk;
+    fields              (p wallShearStress);
+    surfaces
+    {
+        wall
+        {
+            type        patch;
+            patches     ( "%s" );
+            triangulate true;
+        }
+    }
+}
+""" % (name, patch_regex)
+    return out + _foam_footer()
+
+
+def _wall_shear_stress_dict(name="wallShearStress", patch_regex=".*body.*"):
+    out = _foam_header(name)
+    out += """%s
+{
+    type            wallShearStress;
+    libs            ("libfieldFunctionObjects.so");
+    writeControl    timeStep;
+    writeInterval   1;
+    patches         ( "%s" );
+}
+""" % (name, patch_regex)
+    return out + _foam_footer()
+
+
+def _latest_time_dir(case_dir):
+    """(value, name) of the newest numeric time directory of a case."""
+    best = None
+    for entry in os.listdir(case_dir):
+        try:
+            t = float(entry)
+        except ValueError:
+            continue
+        if os.path.isdir(os.path.join(case_dir, entry)):
+            if best is None or t > best[0]:
+                best = (t, entry)
+    if best is None:
+        raise RuntimeError("no time directories in {}".format(case_dir))
+    return best
+
+
+def _compute_wall_shear_stress(case_dir, patch_regex=".*body.*"):
+    """Write the wallShearStress volVectorField for a finished laminar case.
+
+    OF14 difference: ``foamPostProcess -func wallShearStress`` cannot run
+    stand-alone here ("Unable to find turbulence model in the database",
+    wallShearStress.C:206) - the FO looks the momentum-transport model up in
+    the mesh registry, which only exists while a solver is running (laminar
+    models included). Workaround: restart simpleFoam from the latest time
+    for exactly one iteration with the FO attached via a controlDict
+    ``functions`` entry; one extra iteration changes the converged field
+    negligibly, and the new time directory carries U/p (writeInterval 1)
+    plus wallShearStress for the surfaces FO to sample."""
+    latest, _ = _latest_time_dir(case_dir)
+    end_time = int(latest) + 1
+    _write(os.path.join(case_dir, "system", "wallShearStressDict"),
+           _wall_shear_stress_dict(patch_regex=patch_regex))
+    txt = _control_dict(end_time)
+    txt = txt.replace("startFrom       startTime;",
+                      "startFrom       latestTime;")
+    txt = txt.replace("writeInterval   %d;" % end_time,
+                      "writeInterval   1;")
+    txt += "\nfunctions\n{\n    #include \"wallShearStressDict\"\n}\n"
+    _write(os.path.join(case_dir, "system", "controlDict"), txt)
+    _run(["simpleFoam"], case_dir, "log.wallShearStress")
+
+
+def export_surface(case_dir, out_path, bc, decoder, latent):
+    """Post-process a finished case into a wall-surface npz:
+    wallShearStress FO (solver-embedded, OF14 laminar workaround) ->
+    surfaces FO (vtk, patch body.*) ->
+    per-face centers/areas + Cp = p/(0.5 U^2) / cf = tau_w/(0.5 U^2) +
+    decoder normals -> GT Cd/Cl -> npz
+    (centers/normals/areas/cp/cf f32, cd_gt/cl_gt scalars)."""
+    U, direction = _parse_bc(bc)
+    _compute_wall_shear_stress(case_dir)
+    _write(os.path.join(case_dir, "system", "surfaceDict"), _surface_dict())
+    _run(["foamPostProcess", "-latestTime", "-dict",
+          os.path.join("system", "surfaceDict")], case_dir, "log.surfaces")
+    hits = sorted(glob.glob(os.path.join(
+        case_dir, "postProcessing", "surfaces", "*", "wall.vtk")))
+    if not hits:
+        raise RuntimeError("no surfaces output in {}".format(case_dir))
+    import pyvista as pv
+    mesh = pv.read(hits[-1])
+    if mesh.n_cells < 1:
+        raise RuntimeError("empty wall surface in {}".format(hits[-1]))
+    faces = np.asarray(mesh.faces).reshape(-1, 4)[:, 1:4]
+    tri = np.asarray(mesh.points, dtype=np.float64)[faces]      # (F,3,3)
+    centers = tri.mean(axis=1)
+    cr = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    areas = 0.5 * np.linalg.norm(cr, axis=1)
+    p = np.asarray(mesh.cell_data["p"], dtype=np.float64).reshape(-1)
+    wss = np.asarray(
+        mesh.cell_data["wallShearStress"], dtype=np.float64).reshape(-1, 3)
+    if p.shape[0] != centers.shape[0] or wss.shape[0] != centers.shape[0]:
+        raise RuntimeError("field/cell count mismatch in {}".format(hits[-1]))
+    q_inf = 0.5 * U * U
+    cp = (p / q_inf).astype(np.float32)
+    # OF14 sign convention: wallShearStress = -devTau on the patch
+    # (wallShearStress.C), while the viscous force on the body is
+    # +magSf*devTau (forcesBase.C) - negate so cf is the traction ON the
+    # body, matching F = -sum cp*n*A + sum cf*A (verified against the
+    # forces FO on the smoke case).
+    cf = (-wss / q_inf).astype(np.float32)
+    normals = decoder_normals(decoder, latent, centers)
+    cd, cl = integrate_cd_cl(cp, cf, normals, areas, direction)
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    np.savez(out_path,
+             centers=centers.astype(np.float32), normals=normals,
+             areas=areas.astype(np.float32), cp=cp, cf=cf,
+             cd_gt=np.asarray(float(cd), dtype=np.float32),
+             cl_gt=np.asarray(float(cl), dtype=np.float32))
+    return out_path
+
+
+def validate_surface_npz(path):
+    """Hard checks on an exported surface npz (spec section 3.3)."""
+    data = np.load(path)
+    for key in ("centers", "normals", "areas", "cp", "cf", "cd_gt", "cl_gt"):
+        if key not in data.files:
+            raise RuntimeError("surface npz {} missing '{}'".format(path, key))
+    n_faces = data["centers"].shape[0]
+    if n_faces < 1000:
+        raise RuntimeError("surface npz {} has only {} faces".format(
+            path, n_faces))
+    for key in ("centers", "normals", "areas", "cp", "cf"):
+        if not np.isfinite(data[key]).all():
+            raise RuntimeError("surface npz {} has non-finite {}".format(
+                path, key))
+    norms = np.linalg.norm(data["normals"], axis=1)
+    if not np.allclose(norms, 1.0, atol=1e-3):
+        raise RuntimeError("surface npz {} normals not unit".format(path))
+    cd = float(data["cd_gt"])
+    if not (1e-3 < cd < 2.0):
+        raise RuntimeError("surface npz {} cd_gt={} out of range".format(
+            path, cd))
