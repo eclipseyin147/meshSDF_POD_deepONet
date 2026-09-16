@@ -34,6 +34,12 @@ DEFAULT_CFG = {
     "n_clusters": 12, "seed": 0, "stats_sample": 4096,
     # analysis / adaptive sampling
     "analyze_points": 65536, "adaptive_points": 4096, "adaptive_eps": 0.1,
+    # surface stage
+    "surface_trunk_hidden": 512, "surface_trunk_layers": 4,
+    "force_hidden": 256, "force_layers": 2,
+    "surface_points": 4096, "lambda_force": 1.0,
+    "lambda_consistency": 0.1, "branch_lr_scale": 0.1,
+    "surface_iters": 10000,
 }
 
 OUT_VARS = ("u", "v", "w", "p")
