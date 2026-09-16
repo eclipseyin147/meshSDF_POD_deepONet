@@ -36,9 +36,10 @@ W2 依赖新数据：OpenFOAM 壁面场重导出（全部 281 形状，用户已
 - 新 `export_surface(case_dir, out_npz, U)`：
   1. `foamPostProcess -latestTime -dict system/surfaceDict`；
   2. pyvista 读 `postProcessing/surfaces/<time>/wall.vtp`（pip 安装 `pyvista`，新增依赖入报告）；
-  3. 三角形 → 面心 `centers (F,3)`、面积 `areas (F,)`（顶点叉积；patch 法向弃用，改用 §3.3 的 decoder 法向）；
+  3. 三角形 → 面心 `centers (F,3)`、面积 `areas (F,)`（顶点叉积；patch 自带法向弃用，统一改用 §3.2 的 decoder 法向）；
   4. cell 数据 p、wallShearStress → `Cp = p/(½U²)`、`cf = τw/(½U²)`（与体积线同约定）；
-  5. 存 `data/openfoam/ellipsoids_u10/surface/<cache_key>.npz`：`centers/normals/areas/cp (F,..) f32`、`cf (F,3) f32`、`cd_gt`、`cl_gt` 标量。
+  5. 按 §3.2 公式积分出 `cd_gt`、`cl_gt`；
+  6. 存 `data/openfoam/ellipsoids_u10/surface/<cache_key>.npz`：`centers (F,3)`、`normals (F,3)`（decoder 法向）、`areas (F,)`、`cp (F,)`、`cf (F,3)` 全 f32 + `cd_gt`、`cl_gt` 标量。
 
 ### 3.2 法向与力积分约定（GT 与预测共用同一公式）
 
@@ -85,13 +86,13 @@ force_head    = MLP(20 → 256×2 → 2, silu)              # (Cd, Cl)
 
 - **共享 field stage 的 branch**（同一 nn.Module 传入两个 DeepONet 容器）。
 - 冻结策略：volume trunk+decoder 冻结；branch 以 0.1× lr 联合微调；surface trunk/decoder/force head 全 lr。
-- surface 标签 z-score（train 形状表面点统计，存 stats.pth 新增键 `surf_mean/surf_mean (4,)`）；Cd/Cl 标签 z-score 同理。
+- surface 标签 z-score（train 形状表面点统计，存 stats.pth 新增键 `surf_mean/surf_std (4,)`）；Cd/Cl 标签按 train 集分量 std 缩放，分量 std 过小时（如近对称形状的 Cl）以 `max(std_c, 0.1·std_Cd)` 为尺度，防止归一化爆炸。
 
 ### 5.2 surface 训练
 
-- 采样：每 case 抽 4096 表面点（faces 均匀随机）；场真值 = surface npz 的 cp/cf。
-- loss：`L_surf`（4 通道标准化 MSE 求和）+ `λ_f·(|Cd_int−Cd_gt| + |Cl_int−Cl_gt| + |Cd_head−Cd_gt| + |Cl_head−Cl_gt|)` + `λ_c·((Cd_head−Cd_int)² + (Cl_head−Cl_int)²)`；λ_f=1（力在 z-score 空间）、λ_c=0.1。
-- Cd_int/Cl_int：对**预测**表面场（反标准化后）按 §3.2 公式在全表面上积分（抽样点积分用 `A_total/n_sample` 缩放近似；评估时用全表面）。
+- 采样：每 case 按**面积加权**抽 4096 表面点（`P(f) ∝ A_f`）；场真值 = surface npz 的 cp/cf。
+- loss：`L_surf`（4 通道标准化 MSE 求和）+ `λ_f·(|Cd_int−Cd_gt| + |Cl_int−Cl_gt| + |Cd_head−Cd_gt| + |Cl_head−Cl_gt|)` + `λ_c·((Cd_head−Cd_int)² + (Cl_head−Cl_int)²)`；λ_f=1（力按上述尺度归一）、λ_c=0.1。
+- Cd_int/Cl_int：对**预测**表面场（反标准化后）按 §3.2 公式积分；训练时用面积加权 MC 估计 `(A_total/n_sample)·Σ_i f_i`（无偏），评估时用全表面精确积分。
 
 ### 5.3 surface 评估
 
