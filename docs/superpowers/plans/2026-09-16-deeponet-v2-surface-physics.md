@@ -1033,10 +1033,9 @@ def run_surface_stage(args, cfg):
 
     t0 = time.time()
     for it in range(start_iter, iters):
-        for g in opt.param_groups:
+        for i, g in enumerate(opt.param_groups):
             g["lr"] = lr_at(it) * (
-                cfg["branch_lr_scale"]
-                if g is param_groups[0] else 1.0)
+                cfg["branch_lr_scale"] if i == 0 else 1.0)
         cases = [train_shapes[int(torch.randint(0, len(train_shapes),
                                                 (1,), generator=gen))]
                  for _ in range(cfg["batch_cases"])]
