@@ -45,6 +45,9 @@ def parse_args():
     p.add_argument("--analyze", action="store_true",
                    help="write analysis.json (near/far masked per-case "
                         "errors, worst-10) from <out_name>/best.mdlus")
+    p.add_argument("--adaptive_sampling", action="store_true",
+                   help="shape-level error-adaptive case sampling "
+                        "(spec section 4.2)")
     return p.parse_args()
 
 
@@ -215,14 +218,23 @@ def main():
     # --- train --------------------------------------------------------------
     metrics_path = os.path.join(out_dir, "metrics.jsonl")
     gen = torch.Generator().manual_seed(seed)
+    shape_weights = None
+    if args.adaptive_sampling:
+        shape_weights = torch.ones(len(train_shapes))
     model.train()
     t0 = time.time()
     for it in range(start_iter, cfg["iters"]):
         for g in opt.param_groups:
             g["lr"] = lr_at(it)
-        cases = [train_shapes[int(torch.randint(0, len(train_shapes), (1,),
-                                              generator=gen))]
-                 for _ in range(cfg["batch_cases"])]
+        if shape_weights is not None:
+            picks = torch.multinomial(shape_weights, cfg["batch_cases"],
+                                      replacement=True,
+                                      generator=gen).tolist()
+            cases = [train_shapes[i] for i in picks]
+        else:
+            cases = [train_shapes[int(torch.randint(0, len(train_shapes),
+                                                    (1,), generator=gen))]
+                     for _ in range(cfg["batch_cases"])]
         opt.zero_grad(set_to_none=True)
         loss = torch.zeros((), device=device)
         for c in cases:
@@ -260,6 +272,25 @@ def main():
             if res["rel_l2"] < best:
                 best = res["rel_l2"]
                 model.save(os.path.join(out_dir, "best.mdlus"))
+            if args.adaptive_sampling:
+                model.eval()
+                quick = rd.evaluate(model, train_shapes, grid_points,
+                                    stats_g, cfg,
+                                    n_points=cfg["adaptive_points"],
+                                    seed=1000 + it)
+                model.train()
+                errs = torch.tensor([quick["per_case"][s["name"]]
+                                     for s in train_shapes])
+                shape_weights = errs / errs.mean().clamp_min(1e-12) \
+                    + cfg["adaptive_eps"]
+                top = torch.argsort(shape_weights, descending=True)[:5]
+                logging.info("adaptive top-5: %s",
+                             [train_shapes[i]["name"] for i in top])
+                rec = {"iter": it + 1, "adaptive_mean_err":
+                       float(errs.mean()),
+                       "adaptive_worst_err": float(errs.max())}
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
             torch.save({"model_state_dict": model.state_dict(),
                         "optimizer_state_dict": opt.state_dict(),
                         "iter": it + 1, "best": best}, state_path)
