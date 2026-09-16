@@ -75,7 +75,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     args._out_dir = out_dir
     if args.stage == "surface":
-        raise SystemExit("surface stage: see Task 6")
+        from deep_sdf.cfd import roadmap_surface
+        roadmap_surface.run_surface_stage(args, cfg)
+        return
     if args.stage == "physics":
         from deep_sdf.cfd import roadmap_physics
         roadmap_physics.run_physics_stage(args, cfg)
