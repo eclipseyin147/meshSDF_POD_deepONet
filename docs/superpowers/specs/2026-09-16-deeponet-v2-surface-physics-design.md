@@ -122,7 +122,7 @@ analyze:  analysis.json
 ## 8. 验收标准
 
 1. W1：`analysis.json` 产出且含近壁/远域分解与 worst-10；field+adaptive run 的 val rel_l2 ≤ 0.27（MVP 0.2513 基准，允许波动）且 worst-10 平均误差较 MVP run 下降。
-2. W2a：281 个 surface npz 全部通过 §3.3 校验；surface_summary.json 记录成功率。
+2. W2a：276 个 surface npz 通过 §3.3 校验（5 个 latent 超界退化形状——lhs/shape_{007,087,174,253,254}——经 2026-09-16 用户裁定排除，清单 `surface/excluded_shapes.json`；其体积快照保留在 field 线作 OOD 压力测试）；surface_summary.json 记录成功率。
 3. W2b：eval_surface.json 含 Cp/Cf 分变量 rel L2 与 test 集 Cd/Cl 相对误差中位数（head/integral 两路）；Cd 中位数误差目标 < 10%。
 4. W3：eval_physics.json 的 continuity/momentum residual 较 field-only 模型下降；val rel_l2 变化 ≤ +0.03。
 5. 全部 stage 的 smoke 通过；产物不入 git；torch 2.5.1 不动；vendored physicsnemo 不改。

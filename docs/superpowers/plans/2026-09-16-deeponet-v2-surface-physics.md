@@ -18,6 +18,7 @@
 - MVP 已有产物 `examples/ellipsoids/RoadmapONet/best.mdlus` 是 surface/physics 的 init_from 源，**不得被覆盖**：field 增强 run 一律用 `--out_name RoadmapONet_adaptive`。
 - 关键数据事实（实现者须知）：
   - 表面真值 npz 契约（本计划 T1 产出）：`data/openfoam/ellipsoids_u10/surface/<cache_key>.npz`，键 `centers (F,3)` / `normals (F,3)`（decoder SDF 梯度归一化，物体外向）/ `areas (F,)` / `cp (F,)` / `cf (F,3)` 全 f32 + 标量 `cd_gt` / `cl_gt`；`cache_key(name)` 见 roadmap_deeponet.py（`lhs/shape_001.npz`→`lhs_shape_001`）。
+  - **退化形状排除（2026-09-16 用户裁定）**：5 个 latent 超界形状（`lhs/shape_{007,087,174,253,254}.npz`，|z|>1.36 超 CodeBound=1.0，snappy body patch 塌缩 <1000 面）从 surface 阶段排除；排除清单 `data/openfoam/ellipsoids_u10/surface/excluded_shapes.json`（`load_surface_exclusions` 读取）；其 npz 存在但无效（面数过少），`load_surface` 必须经 `validate_surface_npz` 校验拒绝之。field 线不受影响。surface 阶段有效形状数 = 276。
   - 力积分约定（GT 与预测共用，`openfoam_runner.integrate_cd_cl` 唯一实现）：`F = −Σ cp·n·A + Σ cf·A`；`cd = F·dir/A_ref`、`cl = F_z/A_ref`；`A_ref = Σ max(0, −n·dir)·A`。
   - 快照 `bc` = `[10,1,0,0]` 全部 281 case；`bc[1:4]` = 来流方向 = +x。
   - 体积快照 `snapshots/`、几何缓存 `sdf_cache/`、manifest `lhs_latents.npz`（281×16）沿用 MVP；网格 `make_stretched_grid()` 默认（(1442897,3)，域 [-1.5,1.5]³，`domain_half=1.5`）。
@@ -730,8 +731,9 @@ git commit -m "Add error-adaptive shape sampling (--adaptive_sampling)"
 - Consumes: Task 1 的 surface npz 契约与 `integrate_cd_cl`；MVP 的 `predict_normalized`/trunk 特征/`build_model` 模式；`DeepONet.branch1` 共享；Task 3 的 `prepare_experiment`。
 - Produces:
   - `SURF_VARS = ("cp", "cfx", "cfy", "cfz")`
-  - `load_surface(surface_dir, name) -> dict(centers (F,3), normals (F,3), areas (F,), cp (F,), cf (F,3), cd_gt float, cl_gt float)`（CPU tensors）
-  - `attach_surface(shapes, surface_dir) -> shapes`（每 shape 增 `"surf"` 键）
+  - `load_surface(surface_dir, name) -> dict(centers (F,3), normals (F,3), areas (F,), cp (F,), cf (F,3), cd_gt float, cl_gt float)`（CPU tensors；加载时经 `validate_surface_npz` 校验，无效 npz 抛 RuntimeError）
+  - `load_surface_exclusions(surface_dir) -> set[str]`（读 `excluded_shapes.json`，不存在则空集）
+  - `attach_surface(shapes, surface_dir) -> shapes`（每 shape 增 `"surf"` 键；排除清单中的形状静默跳过、不挂 "surf"——调用方须在 attach 后过滤 `[s for s in shapes if "surf" in s]`）
   - `compute_surface_stats(train_shapes) -> dict`：`surf_mean/surf_std (4,)`、`force_mean/force_std (2,)`（force_std 下限 `0.1*cd_std`）
   - `surface_features(xyz (N,3), normal (N,3), n_bands, domain_half) -> (N, 42)`
   - `build_surface_model(field_model, cfg) -> (surface_model, force_head)`
@@ -777,8 +779,21 @@ from deep_sdf.cfd.openfoam_runner import integrate_cd_cl
 SURF_VARS = ("cp", "cfx", "cfy", "cfz")
 
 
+def load_surface_exclusions(surface_dir):
+    """Read surface/excluded_shapes.json (degenerate latent-extrapolated
+    shapes, plan Global Constraints); returns an empty set when absent."""
+    path = os.path.join(surface_dir, "excluded_shapes.json")
+    if not os.path.isfile(path):
+        return set()
+    with open(path) as f:
+        return set(json.load(f)["excluded"])
+
+
 def load_surface(surface_dir, name):
-    data = np.load(os.path.join(surface_dir, cache_key(name) + ".npz"))
+    path = os.path.join(surface_dir, cache_key(name) + ".npz")
+    from deep_sdf.cfd.openfoam_runner import validate_surface_npz
+    validate_surface_npz(path)
+    data = np.load(path)
     out = {k: torch.from_numpy(np.asarray(data[k], dtype=np.float32))
            for k in ("centers", "normals", "areas", "cp", "cf")}
     out["cd_gt"] = float(np.asarray(data["cd_gt"]))
@@ -787,7 +802,15 @@ def load_surface(surface_dir, name):
 
 
 def attach_surface(shapes, surface_dir):
-    for s in shapes:
+    """Attach the 'surf' dict to each shape. Shapes on the exclusion list
+    are skipped (no 'surf' key) - callers must filter them out afterwards:
+    ``shapes = [s for s in shapes if "surf" in s]``."""
+    excluded = load_surface_exclusions(surface_dir)
+    for s in list(shapes):
+        if s["name"] in excluded:
+            logging.info("surface: excluding degenerate shape %s",
+                         s["name"])
+            continue
         if "surf" not in s:
             s["surf"] = load_surface(surface_dir, s["name"])
     return shapes
@@ -954,7 +977,11 @@ def run_surface_stage(args, cfg):
     surface_dir = os.path.join(args.data_root, "surface")
     grid_points = prep["grid_points"]
     split = prep["split"]
-    train_shapes = attach_surface(prep["train_shapes"], surface_dir)
+    train_shapes = [s for s in attach_surface(prep["train_shapes"],
+                                              surface_dir)
+                    if "surf" in s]
+    if not train_shapes:
+        raise RuntimeError("no train shapes with valid surface data")
     stats = prep["stats"]
     stats.update(compute_surface_stats(train_shapes))
     stats_g = {k: v.to(device) for k, v in stats.items()}
@@ -980,7 +1007,8 @@ def run_surface_stage(args, cfg):
         return cfg["lr_min"] + 0.5 * (cfg["lr"] - cfg["lr_min"]) * (
             1 + np.cos(np.pi * t))
 
-    val_shapes = attach_surface(prep["load"](split["val"]), surface_dir)
+    val_shapes = [s for s in attach_surface(prep["load"](split["val"]),
+                                            surface_dir) if "surf" in s]
     if args.smoke:
         val_shapes = val_shapes[:8]
     metrics_path = os.path.join(out_dir, "metrics_surface.jsonl")
@@ -1089,8 +1117,9 @@ def run_surface_stage(args, cfg):
 
     if not args.smoke:
         surface_model.eval(); force_head.eval()
-        test_shapes = attach_surface(prep["load"](split["test"]),
-                                     surface_dir)
+        test_shapes = [s for s in attach_surface(prep["load"](split["test"]),
+                                                 surface_dir)
+                       if "surf" in s]
         res = {"val": evaluate_surface(surface_model, force_head,
                                        val_shapes, stats_g, cfg),
                "test": evaluate_surface(surface_model, force_head,
@@ -1207,19 +1236,29 @@ main() 中 `os.makedirs(out_dir, exist_ok=True)` 之后、`# --- data ---` 段�
         raise SystemExit("physics stage is added by a later task")
 ```
 
-- [ ] **Step 2: 表面数据门禁（Task 2 批跑必须已完成）**
+- [ ] **Step 2: 表面数据门禁（Task 2 批跑必须已完成；276 有效 + 5 排除，见 Global Constraints 排除条款）**
 
 ```bash
 .venv/bin/python - <<'EOF'
 import json, os, glob
 s = json.load(open("data/openfoam/ellipsoids_u10/surface/surface_summary.json"))
-assert s["ok"] + s["skipped"] == s["total"] == 281, s
-n = len(glob.glob("data/openfoam/ellipsoids_u10/surface/*.npz"))
-assert n == 281, n
-print("SURFACE-DATA-OK", s["ok"], "ran,", s["skipped"], "skipped")
+exc = json.load(open("data/openfoam/ellipsoids_u10/surface/excluded_shapes.json"))
+assert s["ok"] + s["skipped"] == 276, s
+assert len(s["failed"]) == 5, s["failed"]
+assert sorted(f["shape"] for f in s["failed"]) == sorted(exc["excluded"])
+from deep_sdf.cfd.openfoam_runner import validate_surface_npz
+valid = 0
+for p in glob.glob("data/openfoam/ellipsoids_u10/surface/*.npz"):
+    try:
+        validate_surface_npz(p)
+        valid += 1
+    except RuntimeError:
+        pass
+assert valid == 276, valid
+print("SURFACE-DATA-OK 276 valid, 5 excluded")
 EOF
 ```
-Expected: `SURFACE-DATA-OK ...`。若批跑仍在进行（surface_summary.json 不存在）：等待其完成（`tail -f` 批跑日志）再继续，不要在本步启动第二次批跑。
+Expected: `SURFACE-DATA-OK 276 valid, 5 excluded`。若批跑仍在进行（surface_summary.json 不存在）：等待其完成（`tail -f` 批跑日志）再继续，不要在本步启动第二次批跑。
 
 - [ ] **Step 3: smoke + 正式训练 + 评估**
 
