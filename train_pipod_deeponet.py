@@ -498,7 +498,8 @@ def train_stage2(args, branch, branch_kwargs, bases, train_shapes,
                          near_band=(args.field_near_band
                                     if args.field_near_frac > 0 else None),
                          h_grid=h_grid)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
     scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
     gen = torch.Generator().manual_seed(args.seed)
@@ -731,7 +732,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
                          h_grid=h_grid)
     informer = PDEInformer(IncompressibleNS(re=args.re).equations)
     sampler = CollocationSampler(margin=args.margin)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
     scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
     gen = torch.Generator().manual_seed(args.seed)
@@ -875,7 +877,8 @@ def train_stage3(args, branch, branch_kwargs, bases, train_shapes,
 
 def train_stage1(args, branch, branch_kwargs, bases, train_shapes,
                  train_cases, val_cases, out_dir, rng):
-    optimizer = torch.optim.Adam(branch.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(branch.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
     scheduler = make_scheduler(optimizer, args)
     loss_fn = torch.nn.MSELoss()
     start = time.time()
@@ -1034,6 +1037,9 @@ if __name__ == "__main__":
                         "--iters, so the total length may change")
     parser.add_argument("--iters", dest="iterations", type=int, default=20000)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="AdamW weight decay (0 = plain Adam; ~1e-4 "
+                        "counteracts the stage-1 single-case overfitting)")
     parser.add_argument("--lr_schedule", choices=["constant", "cosine"],
                         default="constant",
                         help="'constant' (old behavior) or 'cosine' with 2%% "
