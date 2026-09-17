@@ -22,13 +22,20 @@ shape name).
 
 Batch mode (--lhs N, Task 11): Latin-hypercube sample N latent codes inside
 the per-dimension [min, max] range of the 27 training latents expanded by 10%
-(``--seed`` reproducible), keep the samples whose decoder mesh passes the
+(``--seed`` reproducible; with ``--latent_max_norm`` candidates above the
+threshold are rejected and redrawn before any mesh extraction - R4 keeps the
+samples inside the decoder's trained norm ball), keep the samples whose
+decoder mesh passes the
 validity check (non-empty, more than 500 faces, vertices within
 [-1.2, 1.2]^3, no NaN), and write the latent manifest
 ``<root>/lhs_latents.npz`` (arrays ``names`` + ``latents``: the 27 training
 ellipsoids keyed by their split npz names plus the accepted
 ``lhs/shape_XXX.npz`` samples), so the training side can resolve every
-snapshot's ``shape`` field to a latent code. Every shape - the 27 training
+snapshot's ``shape`` field to a latent code. The 27 analytic anchors come
+from the experiment's split.json when present, otherwise from a seed
+manifest passed via ``--manifest`` (e.g. analytic27_latents.npz); the merged
+manifest is written back to the ``--manifest`` path. Every shape - the 27
+training
 ellipsoids (analytic STL + analytic SDF mask) and the accepted LHS samples
 (decoder STL + decoder SDF mask) - gets ``--cases_per_shape`` boundary
 conditions (U ~ U(--u_range), direction uniform on the sphere, per-shape
@@ -38,9 +45,15 @@ Task-10-validated configuration written by openfoam_runner.make_case) with
 per-case dictionary edits via foamlib (0/U internalField + freestreamValue =
 U * dir, 0/p freestream value, snappyHexMeshDict wake box along the flow
 direction, controlDict endTime) and run with ``--jobs`` concurrent workers;
-an existing snapshot whose stored bc matches is skipped. Failures
+an existing snapshot whose stored bc matches is skipped. With
+``--export_surface`` each successful solve additionally exports the wall
+surface fields to ``<root>/surface/<cache_key(shape)>.npz``
+(openfoam_runner.export_surface + validate_surface_npz) - single solve,
+double output - and a case is skipped only when both products exist and
+validate. Failures
 (meshing/solver/sampling) are skipped, collected, and summarized in
-``<root>/batch_summary.json``.
+``<root>/batch_summary.json``. ``--dry_run`` stops after the case specs are
+built (no OpenFOAM run).
 
 Requires the OpenFOAM 14 environment: ``source /opt/openfoam14/etc/bashrc``.
 """
@@ -192,21 +205,51 @@ def lhs_bounds(latents, margin=0.1):
     return np.stack([lo - margin * span, hi + margin * span], axis=1)
 
 
-def lhs_sample(n_samples, bounds, seed):
+def lhs_sample(n_samples, bounds, seed, max_norm=None,
+               max_resample_factor=10):
     """Latin-hypercube sample of ``n_samples`` points inside ``bounds``
     ((D, 2) array): per dimension, one sample per stratum with a random
     permutation of the strata. Deterministic for a given ``seed`` (numpy
-    RandomState). Returns (n_samples, D) float32."""
+    RandomState). Returns (n_samples, D) float32.
+
+    With ``max_norm`` set, candidates with ||z||_2 > max_norm are rejected
+    and redrawn - each round LHS-samples the still-missing count off the
+    same RandomState - until ``n_samples`` survive. Raises RuntimeError when
+    ``max_resample_factor * n_samples`` total draws are not enough
+    (threshold far below the typical latent norm). ``max_norm=None``
+    reproduces the pre-filter stream exactly (same rng call sequence)."""
     rng = np.random.RandomState(int(seed))
     n = int(n_samples)
     bounds = np.asarray(bounds, dtype=np.float64)
     d = bounds.shape[0]
-    unit = np.empty((n, d), dtype=np.float64)
-    for j in range(d):
-        perm = rng.permutation(n)
-        unit[:, j] = (perm + rng.random_sample(n)) / n
     lo, hi = bounds[:, 0], bounds[:, 1]
-    return (lo + unit * (hi - lo)).astype(np.float32)
+
+    def _draw(m):
+        unit = np.empty((m, d), dtype=np.float64)
+        for j in range(d):
+            perm = rng.permutation(m)
+            unit[:, j] = (perm + rng.random_sample(m)) / m
+        return lo + unit * (hi - lo)
+
+    if max_norm is None:
+        return _draw(n).astype(np.float32)
+    accepted, total, draws = [], 0, 0
+    max_draws = int(max_resample_factor) * n
+    while total < n and draws < max_draws:
+        m = min(n - total, max_draws - draws)
+        batch = _draw(m)
+        draws += m
+        keep = batch[np.linalg.norm(batch, axis=1) <= float(max_norm)]
+        accepted.append(keep)
+        total += keep.shape[0]
+    if total < n:
+        raise RuntimeError(
+            "latent_max_norm={}: only {}/{} LHS candidates survived after "
+            "{} draws ({}x retry cap) - raise the threshold".format(
+                max_norm, total, n, draws, int(max_resample_factor)
+            )
+        )
+    return np.concatenate(accepted, axis=0)[:n].astype(np.float32)
 
 
 def validate_latent_mesh(verts, faces, min_faces=MESH_MIN_FACES,
@@ -337,9 +380,24 @@ def snapshot_matches(path, bc, expected_points):
     )
 
 
-def run_batch_case(spec, template_dir, grid_points, n_procs, keep_case=False):
+def surface_matches(path):
+    """True when an existing surface npz passes validate_surface_npz."""
+    if not os.path.isfile(path):
+        return False
+    try:
+        openfoam_runner.validate_surface_npz(path)
+    except Exception:
+        return False
+    return True
+
+
+def run_batch_case(spec, template_dir, grid_points, n_procs, keep_case=False,
+                   export_surface=False, decoder=None):
     """One batch case: clone template + foamlib edits -> run -> sample ->
-    validate. Never raises; returns a result dict with status
+    validate. With ``export_surface`` the same solve additionally exports
+    the wall surface fields (export_surface + validate_surface_npz into
+    ``spec["surface_path"]`` with ``spec["latent"]``) - single solve, double
+    output. Never raises; returns a result dict with status
     ok/failed (+ stage/error)."""
     result = {
         "case": spec["name"],
@@ -365,6 +423,13 @@ def run_batch_case(spec, template_dir, grid_points, n_procs, keep_case=False):
         )
         stage = "validation"
         load_snapshot(spec["out_path"], expected_points=grid_points.shape[0])
+        if export_surface:
+            stage = "surface export"
+            openfoam_runner.export_surface(
+                spec["case_dir"], spec["surface_path"], spec["bc"], decoder,
+                spec["latent"])
+            stage = "surface validation"
+            openfoam_runner.validate_surface_npz(spec["surface_path"])
     except Exception as e:
         result.update(
             status="failed", stage=stage, error="{}: {}".format(
@@ -384,26 +449,74 @@ def _stl_cache_path(stl_dir, shape_name):
     return os.path.join(stl_dir, base.replace("/", "_") + ".stl")
 
 
+def _is_analytic_name(name):
+    """True when the shape name parses as an analytic ellipsoid
+    (``ellipsoids/ellipsoid/ellipsoid_a.._b.._c..npz``)."""
+    try:
+        parse_ellipsoid_axes(name)
+    except ValueError:
+        return False
+    return True
+
+
 def run_batch(args, cases_root, snapshots_root, grid_points):
     """Task-11 batch: LHS latent sampling -> validity filtering -> manifest
     -> per-shape STLs/SDF masks -> concurrent case generation."""
     decoder, latent_size = load_decoder(args.experiment)
     split_path = os.path.join(args.experiment, "split.json")
-    latent_names, train_latents = load_training_latents(
-        args.latents, split_path, args.data_source
-    )
+    if os.path.isfile(split_path):
+        latent_names, train_latents = load_training_latents(
+            args.latents, split_path, args.data_source
+        )
+    elif os.path.isfile(args.manifest):
+        # split.json was removed from the experiments: seed the analytic
+        # anchors from a manifest npz (e.g. analytic27_latents.npz with the
+        # 27 names + latents). Non-analytic entries (accumulated LHS shapes
+        # of an earlier run) stay in the manifest and are carried over by
+        # the merge/carried-over logic below.
+        seed_names, seed_latents = load_manifest(args.manifest)
+        anchor_idx = [i for i, n in enumerate(seed_names)
+                      if _is_analytic_name(n)]
+        if not anchor_idx:
+            raise RuntimeError(
+                "manifest seed {} has no analytic ellipsoid names".format(
+                    args.manifest
+                )
+            )
+        latent_names = [seed_names[i] for i in anchor_idx]
+        train_latents = np.asarray(seed_latents[anchor_idx],
+                                   dtype=np.float32)
+        logging.info(
+            "no split.json at %s; seeded %d analytic anchors from manifest "
+            "%s", split_path, len(latent_names), args.manifest,
+        )
+    else:
+        raise RuntimeError(
+            "batch mode needs the analytic anchors from a split.json "
+            "({}) or a seed manifest ({}) - neither exists".format(
+                split_path, args.manifest
+            )
+        )
+    if train_latents.shape[1] != latent_size:
+        raise RuntimeError(
+            "anchor latents have size {} but the decoder takes {}".format(
+                train_latents.shape[1], latent_size
+            )
+        )
     logging.info(
         "training latents: %d codes of size %d",
         len(latent_names), latent_size,
     )
 
     bounds = lhs_bounds(train_latents, margin=0.1)
-    z_samples = lhs_sample(args.lhs, bounds, args.seed)
+    z_samples = lhs_sample(args.lhs, bounds, args.seed,
+                           max_norm=args.latent_max_norm)
     offset = int(args.lhs_offset)
     logging.info(
-        "LHS: %d samples in %d dims (bounds expanded by 10%%), seed %d, "
-        "offset %d",
+        "LHS: %d samples in %d dims (bounds expanded by 10%%, seed %d, "
+        "offset %d, latent_max_norm %s)",
         z_samples.shape[0], z_samples.shape[1], args.seed, offset,
+        args.latent_max_norm,
     )
 
     # decoder mesh extraction + validity check (serial, CPU-only)
@@ -496,10 +609,20 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         shape_infos.append({"name": n, "stl": stl, "sdf_mask": mask})
     logging.info("batch shapes: %d", len(shape_infos))
 
-    template_dir = os.path.join(args.root, "template_case")
-    ensure_template_case(template_dir)
+    latent_by_name = {
+        n: z for n, z in zip(manifest_names, manifest_latents)
+    }
+    surface_root = os.path.join(args.root, "surface")
+    if args.export_surface:
+        from deep_sdf.cfd.roadmap_deeponet import cache_key
+        os.makedirs(surface_root, exist_ok=True)
 
-    # case list with skip-on-matching-bc
+    template_dir = os.path.join(args.root, "template_case")
+    if not args.dry_run:
+        ensure_template_case(template_dir)
+
+    # case list with skip-on-matching-bc; with --export_surface a case is
+    # skipped only when the volume snapshot AND a valid surface npz exist
     specs = []
     skipped = []
     for info in shape_infos:
@@ -512,11 +635,17 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         for case_idx, bc in enumerate(bcs):
             snap_name = snapshot_filename(info["name"], case_idx)
             out_path = os.path.join(snapshots_root, snap_name)
-            if snapshot_matches(out_path, bc, grid_points.shape[0]):
+            surface_path = None
+            if args.export_surface:
+                surface_path = os.path.join(
+                    surface_root, cache_key(info["name"]) + ".npz")
+            if snapshot_matches(out_path, bc, grid_points.shape[0]) and (
+                    not args.export_surface
+                    or surface_matches(surface_path)):
                 skipped.append(snap_name)
                 continue
             case_name = snap_name[:-4]
-            specs.append({
+            spec = {
                 "name": case_name,
                 "shape": info["name"],
                 "bc": bc,
@@ -524,11 +653,32 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
                 "sdf_mask": info["sdf_mask"],
                 "case_dir": os.path.join(cases_root, case_name),
                 "out_path": out_path,
-            })
+            }
+            if args.export_surface:
+                spec["latent"] = np.asarray(
+                    latent_by_name[info["name"]], dtype=np.float32)
+                spec["surface_path"] = surface_path
+            specs.append(spec)
     logging.info(
         "batch cases: %d to run, %d skipped (existing snapshot with "
         "matching bc)", len(specs), len(skipped),
     )
+
+    if args.dry_run:
+        for spec in specs:
+            logging.info(
+                "dry-run spec %s: shape=%s bc=%s stl=%s sdf_mask=%s "
+                "latent_norm=%s surface=%s",
+                spec["name"], spec["shape"],
+                ["{:g}".format(float(x)) for x in spec["bc"]], spec["stl"],
+                "analytic" if spec["sdf_mask"] is None else "decoder",
+                None if "latent" not in spec else
+                "{:.4f}".format(float(np.linalg.norm(spec["latent"]))),
+                spec.get("surface_path"),
+            )
+        logging.info("dry-run: %d specs built, no cases run", len(specs))
+        return {"dry_run": True, "specs": len(specs),
+                "skipped": len(skipped), "shapes": len(shape_infos)}
 
     results = [
         {"case": s[:-4], "status": "skipped"} for s in skipped
@@ -541,7 +691,7 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         futures = [
             pool.submit(
                 run_batch_case, spec, template_dir, grid_points, args.n_procs,
-                args.keep_cases
+                args.keep_cases, args.export_surface, decoder
             )
             for spec in specs
         ]
@@ -567,6 +717,8 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
     summary = {
         "seed": args.seed,
         "lhs": int(args.lhs),
+        "latent_max_norm": args.latent_max_norm,
+        "export_surface": bool(args.export_surface),
         "cases_per_shape": int(args.cases_per_shape),
         "u_range": [float(x) for x in args.u_range],
         "bounds": bounds.tolist(),
@@ -682,6 +834,20 @@ def main():
     parser.add_argument("--limit_ellipsoids", type=int, default=None,
                         help="batch mode: only run the first K split "
                         "ellipsoids")
+    parser.add_argument("--latent_max_norm", type=float, default=None,
+                        help="batch mode: reject LHS candidates with "
+                        "||z||_2 above this threshold and resample until "
+                        "--lhs survive (default: no filter, the pre-R4 "
+                        "behavior); cheap - applied before mesh extraction")
+    parser.add_argument("--export_surface", action="store_true",
+                        help="batch mode: single solve, double output - "
+                        "after each successful volume snapshot also export "
+                        "wall surface fields to <root>/surface/"
+                        "<cache_key(shape)>.npz (a case is skipped only "
+                        "when both products already exist and validate)")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="batch mode: stop after the case specs are "
+                        "built (no template case, no OpenFOAM run)")
     parser.add_argument("--checkpoint", default="latest",
                         help="decoder checkpoint name under "
                         "<experiment>/ModelParameters/ (used by "
