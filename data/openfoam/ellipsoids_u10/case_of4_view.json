@@ -1,0 +1,7 @@
+[
+  {
+    "name": "ellipsoid_a0.5_b0.5_c0.5_of4_view",
+    "shape": "ellipsoids/ellipsoid/ellipsoid_a0.5_b0.5_c0.5.npz",
+    "bc": [10.0, 1.0, 0.0, 0.0]
+  }
+]

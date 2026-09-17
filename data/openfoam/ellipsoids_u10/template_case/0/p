@@ -1,0 +1,35 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox       |
+|  \\    /   O peration     | Version:  14                                  |
+|   \\  /    A nd           | Web:      https://openfoam.org               |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       volScalarField;
+    location    "0";
+    object      p;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+dimensions      [kinematicPressure];
+
+internalField   uniform 0;
+
+boundaryField
+{
+    farfield
+    {
+        type            freestreamPressure;
+        freestreamValue uniform 0;
+    }
+    "body.*"
+    {
+        type            zeroGradient;
+    }
+}
+
+
+// ************************************************************************* //
