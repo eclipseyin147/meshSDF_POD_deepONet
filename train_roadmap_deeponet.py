@@ -82,6 +82,13 @@ def main():
         from deep_sdf.cfd import roadmap_physics
         roadmap_physics.run_physics_stage(args, cfg)
         return
+    archived_cfg = os.path.join(out_dir, "config.json")
+    if ((args.eval_only or args.analyze) and args.config is None
+            and os.path.isfile(archived_cfg)):
+        cfg = dict(rd.DEFAULT_CFG)
+        cfg.update(json.load(open(archived_cfg)))
+        logging.info("eval_only/analyze: loaded archived config from %s",
+                     archived_cfg)
     seed = cfg["seed"]
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -123,8 +130,9 @@ def main():
                    "labels": {n: int(l) for n, l in zip(names, labels)}},
                   f, indent=1)
     torch.save(stats, os.path.join(out_dir, "stats.pth"))
-    with open(os.path.join(out_dir, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=1)
+    if not (args.eval_only or args.analyze):
+        with open(os.path.join(out_dir, "config.json"), "w") as f:
+            json.dump(cfg, f, indent=1)
 
     # --- model / optimizer -------------------------------------------------
     model = rd.build_model(cfg).to(device)

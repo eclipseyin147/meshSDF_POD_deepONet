@@ -280,6 +280,7 @@ printf '{"loss_type":"relmse","amp_dtype":"bf16","early_stop_patience":8,"featur
 .venv/bin/python train_roadmap_deeponet.py --eval_only --resume --out_name RoadmapONet_v3a
 .venv/bin/python train_roadmap_deeponet.py --analyze --out_name RoadmapONet_v3a
 ```
+（eval_only/analyze 不带 --config 时自动读 <out_dir>/config.json 存档——2026-09-17 修复）
 （v3b/v3c 同理换 --config 与 --out_name。用 run_in_background 后台逐个跑，等一个完成再启动下一个。early stop 触发属正常，记录实际终止 iter。）
 
 - [ ] **Step 2: 对照报告**
