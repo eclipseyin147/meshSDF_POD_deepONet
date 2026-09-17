@@ -152,7 +152,7 @@ assert n2 == 2447108 + (72 - 43) * 512, n2   # 仅 trunk 首层变宽
 stats = {"z_mean": torch.zeros(16), "z_std": torch.ones(16),
          "bc_mean": torch.zeros(4), "bc_std": torch.ones(4),
          "y_mean": torch.zeros(4), "y_std": torch.ones(4)}
-pred = torch.randn(100, 4); y = torch.randn(100, 4)
+pred = torch.randn(100, 4, requires_grad=True); y = torch.randn(100, 4)
 for lt, ref in (("zmse", None), ("huber", None), ("relmse", None)):
     c = dict(cfg); c["loss_type"] = lt
     l = rd.data_loss(pred, y, stats, c)
