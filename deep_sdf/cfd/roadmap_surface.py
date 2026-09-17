@@ -201,10 +201,12 @@ def run_surface_stage(args, cfg):
     """Surface stage runner: init branch from the field best checkpoint,
     train surface trunk/decoder + force head (branch at 0.1x lr), save
     best_surface.mdlus + best_surface_force.pth + metrics_surface.jsonl,
-    then write eval_surface.json."""
+    then reload the best artifacts and write eval_surface.json. With
+    --eval_only, skip training and only redo the final evaluation."""
     from physicsnemo.experimental.models.xdeeponet.deeponet import DeepONet
     out_dir = args._out_dir
     device = torch.device("cuda")
+    eval_only = getattr(args, "eval_only", False)
     init_from = args.init_from or os.path.join(
         args.experiment_directory, "RoadmapONet", "best.mdlus")
     field_model = DeepONet.from_checkpoint(init_from)
@@ -223,10 +225,14 @@ def run_surface_stage(args, cfg):
                     if "surf" in s]
     if not train_shapes:
         raise RuntimeError("no train shapes with valid surface data")
-    stats = prep["stats"]
-    stats.update(compute_surface_stats(train_shapes))
+    stats_path = os.path.join(out_dir, "stats_surface.pth")
+    if eval_only and os.path.isfile(stats_path):
+        stats = torch.load(stats_path, map_location="cpu")
+    else:
+        stats = prep["stats"]
+        stats.update(compute_surface_stats(train_shapes))
+        torch.save(stats, stats_path)
     stats_g = {k: v.to(device) for k, v in stats.items()}
-    torch.save(stats, os.path.join(out_dir, "stats_surface.pth"))
     with open(os.path.join(out_dir, "config_surface.json"), "w") as f:
         json.dump(cfg, f, indent=1)
 
@@ -256,7 +262,7 @@ def run_surface_stage(args, cfg):
     state_path = os.path.join(out_dir, "train_state_surface.pth")
     gen = torch.Generator().manual_seed(cfg["seed"])
     start_iter, best = 0, float("inf")
-    if args.resume and os.path.isfile(state_path):
+    if not eval_only and args.resume and os.path.isfile(state_path):
         st = torch.load(state_path, map_location=device)
         surface_model.load_state_dict(st["model_state_dict"])
         force_head.load_state_dict(st["force_head_state_dict"])
@@ -272,91 +278,110 @@ def run_surface_stage(args, cfg):
         surface_model.train(); force_head.train()
         return res
 
-    t0 = time.time()
-    for it in range(start_iter, iters):
-        for i, g in enumerate(opt.param_groups):
-            g["lr"] = lr_at(it) * (
-                cfg["branch_lr_scale"] if i == 0 else 1.0)
-        cases = [train_shapes[int(torch.randint(0, len(train_shapes),
-                                                (1,), generator=gen))]
-                 for _ in range(cfg["batch_cases"])]
-        opt.zero_grad(set_to_none=True)
-        loss = torch.zeros((), device=device)
-        for c in cases:
-            surf = c["surf"]
-            probs = surf["areas"]
-            idx = torch.multinomial(probs, cfg["surface_points"],
-                                    replacement=True, generator=gen)
-            xyz = surf["centers"][idx].to(device)
-            nrm = surf["normals"][idx].to(device)
-            y = torch.cat([surf["cp"][idx].unsqueeze(1),
-                           surf["cf"][idx]], dim=1).to(device)
-            lat = c["latent"].to(device)
-            bc = c["bc"].to(device)
-            pred = predict_surface_normalized(
-                surface_model, lat, bc, xyz, nrm, stats_g, cfg,
-                amp=cfg["amp"])
-            yn = (y - stats_g["surf_mean"]) / stats_g["surf_std"]
-            l_surf = sum(F.mse_loss(pred[:, v], yn[:, v]) for v in range(4))
-            pred_phys = pred * stats_g["surf_std"] + stats_g["surf_mean"]
-            cd_int, cl_int = integrate_cd_cl_mc(
-                pred_phys[:, 0], pred_phys[:, 1:4], nrm,
-                surf["areas"].sum(), bc[1:4])
-            fh = predict_force_normalized(force_head, lat, bc, stats_g)
-            gt = torch.stack([
-                (torch.as_tensor(c["surf"]["cd_gt"], device=device)
-                 - stats_g["force_mean"][0]) / stats_g["force_std"][0],
-                (torch.as_tensor(c["surf"]["cl_gt"], device=device)
-                 - stats_g["force_mean"][1]) / stats_g["force_std"][1]])
-            ints = torch.stack([
-                (cd_int - stats_g["force_mean"][0])
-                / stats_g["force_std"][0],
-                (cl_int - stats_g["force_mean"][1])
-                / stats_g["force_std"][1]])
-            l_force = (ints - gt).abs().sum() + (fh - gt).abs().sum()
-            l_cons = ((fh - ints) ** 2).sum()
-            loss = loss + l_surf \
-                + cfg["lambda_force"] * l_force \
-                + cfg["lambda_consistency"] * l_cons
-        loss = loss / len(cases)
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
+    if eval_only:
+        surface_model = DeepONet.from_checkpoint(
+            os.path.join(out_dir, "best_surface.mdlus")).to(device).eval()
+        force_head.load_state_dict(torch.load(
+            os.path.join(out_dir, "best_surface_force.pth"),
+            map_location=device))
+        force_head.eval()
+        logging.info("surface eval_only: loaded best_surface artifacts")
+    else:
+        t0 = time.time()
+        for it in range(start_iter, iters):
+            for i, g in enumerate(opt.param_groups):
+                g["lr"] = lr_at(it) * (
+                    cfg["branch_lr_scale"] if i == 0 else 1.0)
+            cases = [train_shapes[int(torch.randint(0, len(train_shapes),
+                                                    (1,), generator=gen))]
+                     for _ in range(cfg["batch_cases"])]
+            opt.zero_grad(set_to_none=True)
+            loss = torch.zeros((), device=device)
+            for c in cases:
+                surf = c["surf"]
+                probs = surf["areas"]
+                idx = torch.multinomial(probs, cfg["surface_points"],
+                                        replacement=True, generator=gen)
+                xyz = surf["centers"][idx].to(device)
+                nrm = surf["normals"][idx].to(device)
+                y = torch.cat([surf["cp"][idx].unsqueeze(1),
+                               surf["cf"][idx]], dim=1).to(device)
+                lat = c["latent"].to(device)
+                bc = c["bc"].to(device)
+                pred = predict_surface_normalized(
+                    surface_model, lat, bc, xyz, nrm, stats_g, cfg,
+                    amp=cfg["amp"])
+                yn = (y - stats_g["surf_mean"]) / stats_g["surf_std"]
+                l_surf = sum(F.mse_loss(pred[:, v], yn[:, v])
+                             for v in range(4))
+                pred_phys = pred * stats_g["surf_std"] + stats_g["surf_mean"]
+                cd_int, cl_int = integrate_cd_cl_mc(
+                    pred_phys[:, 0], pred_phys[:, 1:4], nrm,
+                    surf["areas"].sum(), bc[1:4])
+                fh = predict_force_normalized(force_head, lat, bc, stats_g)
+                gt = torch.stack([
+                    (torch.as_tensor(c["surf"]["cd_gt"], device=device)
+                     - stats_g["force_mean"][0]) / stats_g["force_std"][0],
+                    (torch.as_tensor(c["surf"]["cl_gt"], device=device)
+                     - stats_g["force_mean"][1]) / stats_g["force_std"][1]])
+                ints = torch.stack([
+                    (cd_int - stats_g["force_mean"][0])
+                    / stats_g["force_std"][0],
+                    (cl_int - stats_g["force_mean"][1])
+                    / stats_g["force_std"][1]])
+                l_force = (ints - gt).abs().sum() + (fh - gt).abs().sum()
+                l_cons = ((fh - ints) ** 2).sum()
+                loss = loss + l_surf \
+                    + cfg["lambda_force"] * l_force \
+                    + cfg["lambda_consistency"] * l_cons
+            loss = loss / len(cases)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
 
-        if (it + 1) % cfg["metrics_every"] == 0 or it == start_iter:
-            with open(metrics_path, "a") as f:
-                f.write(json.dumps({
-                    "iter": it + 1, "train_loss": float(loss.item()),
-                    "lr": lr_at(it),
-                    "sec_per_iter": (time.time() - t0)
-                    / (it + 1 - start_iter)}) + "\n")
+            if (it + 1) % cfg["metrics_every"] == 0 or it == start_iter:
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps({
+                        "iter": it + 1, "train_loss": float(loss.item()),
+                        "lr": lr_at(it),
+                        "sec_per_iter": (time.time() - t0)
+                        / (it + 1 - start_iter)}) + "\n")
 
-        if (it + 1) % eval_every == 0 or it + 1 == iters:
-            res = val_metric()
-            crit = res["cp_rel"] + res["cd_int"]
-            with open(metrics_path, "a") as f:
-                f.write(json.dumps({
-                    "iter": it + 1, "val_cp_rel": res["cp_rel"],
-                    "val_cf_rel": res["cf_rel"],
-                    "val_cd_int": res["cd_int"],
-                    "val_cd_head": res["cd_head"]}) + "\n")
-            logging.info("surface iter %d loss %.4f cp_rel %.4f "
-                         "cd_int %.4f cd_head %.4f",
-                         it + 1, float(loss.item()), res["cp_rel"],
-                         res["cd_int"], res["cd_head"])
-            if crit < best:
-                best = crit
-                surface_model.save(os.path.join(out_dir,
-                                                "best_surface.mdlus"))
-                torch.save(force_head.state_dict(),
-                           os.path.join(out_dir, "best_surface_force.pth"))
-            torch.save({"model_state_dict": surface_model.state_dict(),
-                        "force_head_state_dict": force_head.state_dict(),
-                        "optimizer_state_dict": opt.state_dict(),
-                        "iter": it + 1, "best": best}, state_path)
+            if (it + 1) % eval_every == 0 or it + 1 == iters:
+                res = val_metric()
+                crit = res["cp_rel"] + res["cd_int"]
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps({
+                        "iter": it + 1, "val_cp_rel": res["cp_rel"],
+                        "val_cf_rel": res["cf_rel"],
+                        "val_cd_int": res["cd_int"],
+                        "val_cd_head": res["cd_head"]}) + "\n")
+                logging.info("surface iter %d loss %.4f cp_rel %.4f "
+                             "cd_int %.4f cd_head %.4f",
+                             it + 1, float(loss.item()), res["cp_rel"],
+                             res["cd_int"], res["cd_head"])
+                if crit < best:
+                    best = crit
+                    surface_model.save(os.path.join(out_dir,
+                                                    "best_surface.mdlus"))
+                    torch.save(force_head.state_dict(),
+                               os.path.join(out_dir, "best_surface_force.pth"))
+                torch.save({"model_state_dict": surface_model.state_dict(),
+                            "force_head_state_dict": force_head.state_dict(),
+                            "optimizer_state_dict": opt.state_dict(),
+                            "iter": it + 1, "best": best}, state_path)
 
     if not args.smoke:
-        surface_model.eval(); force_head.eval()
+        if not eval_only:
+            # The delivered artifacts are the val-best checkpoints; reload
+            # them so eval_surface.json measures what is actually shipped.
+            surface_model = DeepONet.from_checkpoint(
+                os.path.join(out_dir, "best_surface.mdlus")).to(
+                    device).eval()
+            force_head.load_state_dict(torch.load(
+                os.path.join(out_dir, "best_surface_force.pth"),
+                map_location=device))
+            force_head.eval()
         test_shapes = [s for s in attach_surface(prep["load"](split["test"]),
                                                  surface_dir)
                        if "surf" in s]
@@ -369,4 +394,5 @@ def run_surface_stage(args, cfg):
         logging.info("surface test: cp_rel %.4f cd_int %.4f cd_head %.4f",
                      res["test"]["cp_rel"], res["test"]["cd_int"],
                      res["test"]["cd_head"])
-    logging.info("surface stage done. best crit %.4f", best)
+    if not eval_only:
+        logging.info("surface stage done. best crit %.4f", best)
