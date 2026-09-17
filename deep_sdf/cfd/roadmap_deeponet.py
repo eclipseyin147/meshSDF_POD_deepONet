@@ -87,7 +87,8 @@ def trunk_features(xyz, sdf, normal, n_bands, domain_half,
 
 def build_model(cfg):
     """Assemble the xDeepONet (CPU; caller moves to device). Branch:
-    [z, bc] -> width; trunk: 43 -> width; mlp decoder -> 4 channels."""
+    [z, bc] -> width; trunk: 43 (v1) or 72 (v2) -> width; mlp decoder ->
+    4 channels."""
     from physicsnemo.models.mlp import FullyConnected
     from physicsnemo.experimental.models.xdeeponet.deeponet import DeepONet
 
@@ -124,7 +125,7 @@ def predict_normalized(model, latent, bc, xyz, sdf, normal, stats, cfg,
     xb = torch.cat([z, b]).unsqueeze(0)                      # (1, 20)
     xt = trunk_features(xyz, sdf, normal, cfg["fourier_bands"],
                         cfg["domain_half"],
-                        cfg.get("feature_set", "v1"))           # (N, 43)
+                        cfg.get("feature_set", "v1"))           # (N, 43|72)
     amp_dtype = (torch.bfloat16 if cfg.get("amp_dtype") == "bf16"
                  else torch.float16)
     with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
