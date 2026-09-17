@@ -131,9 +131,11 @@ def main():
     stats_g = {k: v.to(device) for k, v in stats.items()}
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
                             weight_decay=cfg["weight_decay"])
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"])
+    use_scaler = cfg["amp"] and cfg["amp_dtype"] == "fp16"
+    scaler = (torch.amp.GradScaler("cuda") if use_scaler else None)
 
     start_iter, best = 0, float("inf")
+    since_best = 0
     state_path = os.path.join(out_dir, "train_state.pth")
     if args.resume and os.path.isfile(state_path):
         st = torch.load(state_path, map_location=device)
@@ -259,13 +261,15 @@ def main():
             pred = rd.predict_normalized(model, b["latent"], b["bc"],
                                          b["xyz"], b["sdf"], b["normal"],
                                          stats_g, cfg, amp=cfg["amp"])
-            yn = (b["y"] - stats_g["y_mean"]) / stats_g["y_std"]
-            loss = loss + sum(F.mse_loss(pred[:, v], yn[:, v])
-                              for v in range(4))
+            loss = loss + rd.data_loss(pred, b["y"], stats_g, cfg)
         loss = loss / len(cases)
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            opt.step()
 
         if (it + 1) % cfg["metrics_every"] == 0 or it == start_iter:
             rec = {"iter": it + 1, "train_loss": float(loss.item()),
@@ -288,6 +292,9 @@ def main():
             if res["rel_l2"] < best:
                 best = res["rel_l2"]
                 model.save(os.path.join(out_dir, "best.mdlus"))
+                since_best = 0
+            else:
+                since_best += 1
             if args.adaptive_sampling:
                 model.eval()
                 quick = rd.evaluate(model, train_shapes, grid_points,
@@ -310,6 +317,11 @@ def main():
             torch.save({"model_state_dict": model.state_dict(),
                         "optimizer_state_dict": opt.state_dict(),
                         "iter": it + 1, "best": best}, state_path)
+            if (cfg["early_stop_patience"] and
+                    since_best >= cfg["early_stop_patience"]):
+                logging.info("early stop at iter %d (best %.4f)",
+                             it + 1, best)
+                break
 
     logging.info("done. best val rel_l2 %.4f", best)
 
