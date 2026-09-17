@@ -12,6 +12,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from deep_sdf.cfd import physicsnemo_compat as _physicsnemo_compat  # noqa: F401
 from deep_sdf.utils import decode_sdf
@@ -43,6 +44,11 @@ DEFAULT_CFG = {
     # physics stage
     "n_collocation": 4096, "phys_chunk": 256, "lambda_phys": None,
     "physics_iters": 10000, "re": 100.0, "phys_lr_scale": 0.1,
+    # v3 accuracy levers (spec 2026-09-17 v3)
+    "loss_type": "zmse",          # zmse | relmse | huber
+    "feature_set": "v1",          # v1 | v2
+    "amp_dtype": "fp16",          # fp16 | bf16 (bf16: no GradScaler)
+    "early_stop_patience": 0,     # eval cycles without best update; 0=off
 }
 
 OUT_VARS = ("u", "v", "w", "p")
@@ -59,11 +65,24 @@ def fourier_encode(x, n_bands):
     return torch.cat(outs, dim=-1)
 
 
-def trunk_features(xyz, sdf, normal, n_bands, domain_half):
-    """(N,3),(N,1),(N,3) -> (N, 3+1+3+3*2*n_bands): normalized coords,
-    raw (tanh-space) SDF, unit normal, Fourier features of the coords."""
+def trunk_features(xyz, sdf, normal, n_bands, domain_half,
+                   feature_set="v1"):
+    """v1 (3+1+3+3*2*bands): [x̃, sdf, n] + γ(x̃).
+    v2 (12+5*2*bands = 72 @ bands=6), DoMINO-inspired (v3 spec 2.2):
+    raw [x̃(3), sdf(1), scaled_sdf(1), inside(1), n(3), sdf·n(3)]
+    + γ([x̃, sdf, scaled_sdf]) over 5 channels."""
     xn = xyz / domain_half
-    return torch.cat([xn, sdf, normal, fourier_encode(xn, n_bands)], dim=-1)
+    if feature_set == "v1":
+        return torch.cat([xn, sdf, normal, fourier_encode(xn, n_bands)],
+                         dim=-1)
+    if feature_set != "v2":
+        raise ValueError("unknown feature_set: {}".format(feature_set))
+    scaled = sdf / (0.04 + sdf.abs())
+    inside = (sdf < 0).to(sdf.dtype)
+    pseudo = sdf * normal
+    raw = torch.cat([xn, sdf, scaled, inside, normal, pseudo], dim=-1)
+    enc_in = torch.cat([xn, sdf, scaled], dim=-1)
+    return torch.cat([raw, fourier_encode(enc_in, n_bands)], dim=-1)
 
 
 def build_model(cfg):
@@ -72,7 +91,13 @@ def build_model(cfg):
     from physicsnemo.models.mlp import FullyConnected
     from physicsnemo.experimental.models.xdeeponet.deeponet import DeepONet
 
-    trunk_in = 3 + 1 + 3 + 3 * 2 * cfg["fourier_bands"]
+    feature_set = cfg.get("feature_set", "v1")
+    if feature_set == "v1":
+        trunk_in = 3 + 1 + 3 + 3 * 2 * cfg["fourier_bands"]
+    elif feature_set == "v2":
+        trunk_in = 12 + 5 * 2 * cfg["fourier_bands"]
+    else:
+        raise ValueError("unknown feature_set: {}".format(feature_set))
     branch = FullyConnected(
         in_features=cfg["latent_size"] + cfg["bc_dim"],
         layer_size=cfg["branch_hidden"], num_layers=cfg["branch_layers"],
@@ -98,8 +123,11 @@ def predict_normalized(model, latent, bc, xyz, sdf, normal, stats, cfg,
     b = (bc - stats["bc_mean"]) / stats["bc_std"]
     xb = torch.cat([z, b]).unsqueeze(0)                      # (1, 20)
     xt = trunk_features(xyz, sdf, normal, cfg["fourier_bands"],
-                        cfg["domain_half"])                   # (N, 43)
-    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=amp):
+                        cfg["domain_half"],
+                        cfg.get("feature_set", "v1"))           # (N, 43)
+    amp_dtype = (torch.bfloat16 if cfg.get("amp_dtype") == "bf16"
+                 else torch.float16)
+    with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp):
         y = model(xb, xt)[0]                                  # (N, 4)
     return y.float()
 
@@ -414,3 +442,25 @@ def evaluate_detailed(model, shapes, grid_points, stats, cfg, n_points, seed,
             "far_rel": masked_rel(~near),
         }
     return {"cases": cases}
+
+
+def data_loss(pred_norm, y, stats, cfg):
+    """Per-case field loss. pred_norm (N,4) normalized-space prediction,
+    y (N,4) physical (nondimensional) targets. zmse: channelwise MSE in
+    z-score space (MVP behavior); huber: SmoothL1(beta=1) per channel in
+    z-score space; relmse: per-channel relative MSE in physical space
+    sum_c ||p-y||^2/(||y||^2+eps) (v3 spec 2.1 - same shape as the rel-L2
+    eval metric)."""
+    yn = (y - stats["y_mean"]) / stats["y_std"]
+    lt = cfg.get("loss_type", "zmse")
+    if lt == "zmse":
+        return sum(F.mse_loss(pred_norm[:, v], yn[:, v])
+                   for v in range(4))
+    if lt == "huber":
+        return sum(F.smooth_l1_loss(pred_norm[:, v], yn[:, v], beta=1.0)
+                   for v in range(4))
+    if lt == "relmse":
+        pred = pred_norm * stats["y_std"] + stats["y_mean"]
+        return sum(((pred[:, v] - y[:, v]) ** 2).sum()
+                   / ((y[:, v] ** 2).sum() + 1e-12) for v in range(4))
+    raise ValueError("unknown loss_type: {}".format(lt))
