@@ -94,6 +94,19 @@ def boundary_losses(model, shape, bc, grid_points, idx_wall, idx_far,
     return l_wall, l_far
 
 
+def _shape_pools(cache, sampler, grid_g, grid_shape, shape, device):
+    """Per-shape collocation pools (deterministic in sdf/fields/bc) cached
+    across iterations - recomputing the full-grid FD-gradient pools costs
+    ~0.4s per case, dominated by launch-bound tensor ops."""
+    key = (shape["name"], tuple(float(x) for x in shape["bc"]))
+    if key not in cache:
+        cache[key] = sampler._pools(grid_g, grid_shape,
+                                    shape["sdf"].to(device),
+                                    shape["fields"].to(device),
+                                    shape["bc"])
+    return cache[key]
+
+
 @torch.no_grad()
 def eval_residuals(model, decoder, shapes, grid_points, grid_shape, stats,
                    cfg, informer, sampler, n_points, seed, device):
@@ -102,11 +115,14 @@ def eval_residuals(model, decoder, shapes, grid_points, grid_shape, stats,
     from deep_sdf.cfd.physics import CollocationSampler  # noqa: F401
     grid_g = grid_points.to(device)
     gen = torch.Generator().manual_seed(seed)
+    cache = {}
     out = {k: [] for k in ("continuity", "momentum", "wall", "far")}
     for s in shapes:
         picks = sampler.sample(
             grid_g, grid_shape, s["sdf"].to(device),
-            s["fields"].to(device), s["bc"], n_points, gen)
+            s["fields"].to(device), s["bc"], n_points, gen,
+            pools=_shape_pools(cache, sampler, grid_g, grid_shape, s,
+                               device))
         lc, lm = physics_losses(
             model, decoder, s["latent"].to(device),
             s["bc"].to(device), grid_g[picks["collocation"]], stats, cfg,
@@ -187,6 +203,7 @@ def run_physics_stage(args, cfg):
 
     t0 = time.time()
     model.train()
+    pool_cache = {}
     for it in range(start_iter, iters):
         for g in opt.param_groups:
             g["lr"] = lr_at(it)
@@ -212,7 +229,9 @@ def run_physics_stage(args, cfg):
                 picks = sampler.sample(
                     grid_g, grid_shape, c["sdf"].to(device),
                     c["fields"].to(device), c["bc"],
-                    cfg["n_collocation"], gen)
+                    cfg["n_collocation"], gen,
+                    pools=_shape_pools(pool_cache, sampler, grid_g,
+                                       grid_shape, c, device))
                 lc, lm = physics_losses(
                     model, decoder, c["latent"].to(device),
                     c["bc"].to(device), grid_g[picks["collocation"]],

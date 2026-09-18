@@ -253,12 +253,18 @@ class CollocationSampler:
         return pool[sel.to(pool.device)]
 
     def sample(self, grid_points, grid_shape, sdf, fields, bc, n_points,
-               generator, spacing=None):
+               generator, spacing=None, pools=None):
         """-> {"collocation": (n_points,), "wall": (n_points//8,),
         "far": (n_points//8,)} index tensors. ``spacing``: optional
-        per-point local cell size (G,) for stretched grids."""
-        pools = self._pools(grid_points, grid_shape, sdf, fields, bc,
-                            spacing=spacing)
+        per-point local cell size (G,) for stretched grids. ``pools``:
+        optional precomputed ``_pools`` result (CPU index tensors) - the
+        pools are deterministic in (sdf, fields, bc), so callers can cache
+        them per shape instead of recomputing the full-grid finite-
+        difference gradient pools every iteration."""
+        if pools is None:
+            pools = self._pools(grid_points, grid_shape, sdf, fields, bc,
+                                spacing=spacing)
+        pools = {k: v.cpu() for k, v in pools.items()}
         counts = [int(f * n_points) for f in self.fractions[:-1]]
         counts.append(n_points - sum(counts))
         keys = ("near_wall", "wake", "high_grad", "uniform")

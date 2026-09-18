@@ -60,6 +60,7 @@ Requires the OpenFOAM 14 environment: ``source /opt/openfoam14/etc/bashrc``.
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import logging
 import os
@@ -406,13 +407,22 @@ def run_batch_case(spec, template_dir, grid_points, n_procs, keep_case=False,
     }
     t0 = time.time()
     stage = "case setup"
+    t_stage = t0
+    result["stages"] = {}
+
+    def lap(new_stage):
+        nonlocal t_stage, stage
+        result["stages"][stage] = round(time.time() - t_stage, 1)
+        t_stage = time.time()
+        stage = new_stage
+
     try:
         make_case_from_template(
             template_dir, spec["case_dir"], spec["stl"], spec["bc"]
         )
-        stage = "meshing/solver"
+        lap("meshing/solver")
         openfoam_runner.run_case(spec["case_dir"], n_procs=n_procs)
-        stage = "sampling"
+        lap("sampling")
         openfoam_runner.sample_to_snapshot(
             spec["case_dir"],
             grid_points,
@@ -421,15 +431,16 @@ def run_batch_case(spec, template_dir, grid_points, n_procs, keep_case=False,
             spec["out_path"],
             sdf_mask=spec["sdf_mask"],
         )
-        stage = "validation"
+        lap("validation")
         load_snapshot(spec["out_path"], expected_points=grid_points.shape[0])
         if export_surface:
-            stage = "surface export"
+            lap("surface export")
             openfoam_runner.export_surface(
                 spec["case_dir"], spec["surface_path"], spec["bc"], decoder,
                 spec["latent"])
-            stage = "surface validation"
+            lap("surface validation")
             openfoam_runner.validate_surface_npz(spec["surface_path"])
+            lap("done")
     except Exception as e:
         result.update(
             status="failed", stage=stage, error="{}: {}".format(
@@ -578,6 +589,22 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
     # root without re-sampling).
     stl_dir = os.path.join(args.root, "stls")
     os.makedirs(stl_dir, exist_ok=True)
+
+    # SDF mask disk cache: inside-body masks are decoder-derived geometry,
+    # reused across batch restarts so a resume only re-meshes missing STLs.
+    mask_dir = os.path.join(args.root, "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+
+    def cached_sdf_mask(name, z):
+        key = name[:-4].replace("/", "_") if name.endswith(".npz") \
+            else name.replace("/", "_")
+        path = os.path.join(mask_dir, key + ".npz")
+        if os.path.isfile(path):
+            return np.load(path)["mask"]
+        mask = openfoam_runner.decoder_sdf_mask(decoder, z, grid_points)
+        np.savez(path, mask=mask)
+        return mask
+
     shape_infos = []
     if not args.skip_ellipsoids:
         ellipsoid_names = latent_names
@@ -591,8 +618,9 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
             shape_infos.append({"name": name, "stl": stl, "sdf_mask": None})
     for name, z, verts, faces in lhs_accepted:
         stl = _stl_cache_path(stl_dir, name)
-        export_stl(verts, faces, stl)
-        mask = openfoam_runner.decoder_sdf_mask(decoder, z, grid_points)
+        if not os.path.isfile(stl):
+            export_stl(verts, faces, stl)
+        mask = cached_sdf_mask(name, z)
         shape_infos.append({"name": name, "stl": stl, "sdf_mask": mask})
     # carried-over LHS shapes from a merged manifest (already validated)
     fresh = {n for n, _, _, _ in lhs_accepted}
@@ -605,7 +633,7 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
                 decoder, z, resolution=63
             )
             export_stl(verts, faces, stl)
-        mask = openfoam_runner.decoder_sdf_mask(decoder, z, grid_points)
+        mask = cached_sdf_mask(n, z)
         shape_infos.append({"name": n, "stl": stl, "sdf_mask": mask})
     logging.info("batch shapes: %d", len(shape_infos))
 
@@ -683,6 +711,13 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
     results = [
         {"case": s[:-4], "status": "skipped"} for s in skipped
     ]
+    # export_surface queries decoder normals per case; run those queries on
+    # an idle training GPU instead of contending 24 workers on CPU torch,
+    # and pin CPU torch to one thread for whatever stays on the host.
+    export_decoder = decoder
+    if args.export_surface and torch.cuda.is_available():
+        export_decoder = copy.deepcopy(decoder).cuda()
+        torch.set_num_threads(1)
     t0 = time.time()
     done = 0
     with concurrent.futures.ThreadPoolExecutor(
@@ -691,7 +726,7 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
         futures = [
             pool.submit(
                 run_batch_case, spec, template_dir, grid_points, args.n_procs,
-                args.keep_cases, args.export_surface, decoder
+                args.keep_cases, args.export_surface, export_decoder
             )
             for spec in specs
         ]
@@ -701,8 +736,10 @@ def run_batch(args, cases_root, snapshots_root, grid_points):
             done += 1
             if res["status"] == "ok":
                 logging.info(
-                    "case %d/%d %s: ok in %.1fs",
+                    "case %d/%d %s: ok in %.1fs (%s)",
                     done, len(specs), res["case"], res["elapsed"],
+                    ", ".join("{} {}s".format(k, v)
+                              for k, v in res.get("stages", {}).items()),
                 )
             else:
                 logging.warning(

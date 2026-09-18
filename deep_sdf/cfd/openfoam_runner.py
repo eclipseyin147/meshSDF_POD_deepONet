@@ -78,10 +78,13 @@ PROBE_UNSET = -1.0e30  # probes sentinel for locations without a cell
 # torch CUDA libraries, so the Python driver runs without it)
 OF_BASHRC = "/opt/openfoam14/etc/bashrc"
 
-# OpenFOAM 14 is built against the system OpenMPI (FOAM_MPI=openmpi-system);
-# a user-local mpiexec earlier on PATH (e.g. a CUDA build) breaks inside the
-# sourced OpenFOAM environment, so prefer the system launcher explicitly.
-MPIEXEC = "/usr/bin/mpiexec" if os.path.isfile("/usr/bin/mpiexec") else "mpiexec"
+# OpenFOAM 14 is built against the user-local OpenMPI under /usr/local
+# (simpleFoam links /usr/local/lib/libmpi.so.40); the distro /usr/bin/mpiexec
+# belongs to a different 4.1.x build and segfaults the ranks at startup, so
+# prefer the launcher matching the library.
+MPIEXEC = next(
+    (c for c in ("/usr/local/bin/mpiexec", "/usr/bin/mpiexec")
+     if os.path.isfile(c)), "mpiexec")
 
 
 def _foam_header(object_name, cls="dictionary", location="system"):
@@ -206,8 +209,9 @@ def decoder_sdf_mask(decoder, latent, grid_points, max_batch=2 ** 18):
     for non-analytic (latent) shapes."""
     if hasattr(decoder, "eval"):
         decoder.eval()
-    latent = torch.as_tensor(latent, dtype=torch.float32).reshape(1, -1).cpu()
-    pts = torch.as_tensor(grid_points, dtype=torch.float32).reshape(-1, 3).cpu()
+    device = next(decoder.parameters()).device
+    latent = torch.as_tensor(latent, dtype=torch.float32).reshape(1, -1).to(device)
+    pts = torch.as_tensor(grid_points, dtype=torch.float32).reshape(-1, 3).to(device)
     values = torch.zeros(pts.shape[0])
     with torch.no_grad():
         head = 0
